@@ -16,13 +16,18 @@
   --radius-lg: 22px;
   --radius-md: 16px;
   --safe-bottom: env(safe-area-inset-bottom, 0px);
-  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Segoe UI", Tahoma, sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", "Segoe UI", Tahoma, sans-serif;
 }
 
 * { box-sizing: border-box; }
 html { scroll-behavior: smooth; }
 body {
   margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", "Segoe UI", Tahoma, sans-serif;
+  font-feature-settings: "kern" 1;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
   min-width: 320px;
   min-height: 100vh;
   background:
@@ -32,7 +37,10 @@ body {
   -webkit-tap-highlight-color: transparent;
   overflow-x: hidden;
 }
-button, input, textarea, select { font: inherit; }
+button, input, textarea, select {
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", "Segoe UI", Tahoma, sans-serif;
+  font-size: inherit;
+}
 button { color: inherit; }
 button, [role="button"] { touch-action: manipulation; }
 .hidden { display: none !important; }
@@ -97,8 +105,8 @@ button, [role="button"] { touch-action: manipulation; }
   box-shadow: 0 10px 35px rgba(0,0,0,.14);
 }
 .add-card { padding: 14px; }
-.segmented { display:grid; grid-template-columns:1fr 1fr; gap:6px; padding:5px; background:var(--surface-2); border-radius:15px; margin-bottom:14px; }
-.segmented button { min-height:44px; border:0; border-radius:11px; background:transparent; cursor:pointer; font-weight:700; color:var(--muted); }
+.segmented { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:6px; padding:5px; background:var(--surface-2); border-radius:15px; margin-bottom:14px; }
+.segmented button { min-height:46px; border:0; border-radius:11px; padding:7px 6px; background:transparent; cursor:pointer; font-weight:700; color:var(--muted); line-height:1.25; }
 .segmented button.active { background:var(--surface-3); color:var(--text); box-shadow:0 5px 16px rgba(0,0,0,.15); }
 .add-pane { display:grid; gap:10px; }
 .helper { color:var(--muted); font-size:.82rem; line-height:1.6; margin:0; }
@@ -143,7 +151,11 @@ button, [role="button"] { touch-action: manipulation; }
 .email-title { min-width:0; }
 .email-title h3 { margin:0 0 5px; font-size:1rem; overflow-wrap:anywhere; }
 .email-title p { margin:0; color:var(--muted); font-size:.78rem; }
-.email-badge { padding:6px 9px; border-radius:999px; background:var(--accent-soft); color:color-mix(in srgb,var(--accent) 80%,white); font-size:.72rem; white-space:nowrap; }
+.email-badges { display:flex; flex-direction:column; align-items:flex-end; gap:6px; }
+.email-badge, .provider-badge { padding:6px 9px; border-radius:999px; font-size:.69rem; white-space:nowrap; }
+.email-badge { background:var(--accent-soft); color:color-mix(in srgb,var(--accent) 80%,white); }
+.provider-badge.mailtm { background:color-mix(in srgb,var(--success) 15%,transparent); color:color-mix(in srgb,var(--success) 72%,white); }
+.provider-badge.local { background:var(--surface-2); color:var(--muted); }
 .email-metrics { display:grid; grid-template-columns:repeat(3,1fr); gap:7px; margin:14px 0; }
 .metric { background:var(--surface-2); border-radius:13px; padding:9px; text-align:center; }
 .metric b { display:block; font-size:1rem; }
@@ -151,6 +163,8 @@ button, [role="button"] { touch-action: manipulation; }
 .email-actions { display:flex; gap:7px; overflow-x:auto; padding-bottom:2px; scrollbar-width:none; }
 .email-actions::-webkit-scrollbar { display:none; }
 .email-actions .btn { flex:0 0 auto; }
+.simple-actions { overflow:visible; }
+.simple-actions .btn { flex:1 1 0; min-width:0; }
 
 .empty-state { padding:42px 20px; text-align:center; }
 .empty-state .emoji { font-size:2.5rem; }
@@ -216,7 +230,7 @@ button, [role="button"] { touch-action: manipulation; }
 .bottom-nav {
   position:fixed; z-index:40; bottom:0; left:50%; transform:translateX(-50%);
   width:min(100%,1120px); padding:7px 8px calc(7px + var(--safe-bottom));
-  display:grid; grid-template-columns:repeat(5,1fr); gap:4px;
+  display:grid; grid-template-columns:repeat(3,1fr); gap:6px;
   background:color-mix(in srgb,var(--surface) 88%,transparent); border-top:1px solid var(--line);
   -webkit-backdrop-filter:blur(22px); backdrop-filter:blur(22px);
 }
@@ -225,6 +239,7 @@ button, [role="button"] { touch-action: manipulation; }
 .nav-item small { font-size:.64rem; }
 .nav-item.active { color:#fff; background:var(--accent-soft); }
 .footer-note { text-align:center; color:var(--muted); font-size:.7rem; padding:8px 14px 0; }
+.local-email-notice { margin-bottom:16px; }
 
 .settings-list { overflow:hidden; }
 .setting-row { min-height:64px; padding:11px 14px; display:flex; align-items:center; justify-content:space-between; gap:12px; border-bottom:1px solid var(--line); }
@@ -293,6 +308,10 @@ button, [role="button"] { touch-action: manipulation; }
   .topbar p { max-width:250px; }
   .email-metrics { gap:5px; }
   .metric { padding:8px 4px; }
+  .segmented { gap:4px; padding:4px; }
+  .segmented button { font-size:.76rem; padding-inline:3px; }
+  .simple-actions { display:grid; grid-template-columns:1.15fr 1fr .75fr; width:100%; }
+  .simple-actions .btn { width:100%; }
 }
 
 @media (prefers-reduced-motion: reduce) {

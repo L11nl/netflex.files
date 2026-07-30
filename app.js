@@ -111,6 +111,7 @@ function normalizeState(raw) {
       address: email.address || '',
       password: email.password || '',
       token: email.token || '',
+      provider: email.provider === 'local' ? 'local' : 'mailtm',
       localName: email.localName || '',
       createdAt: email.createdAt || new Date().toISOString(),
       status: ['active', 'archived', 'completed'].includes(email.status) ? email.status : 'active',
@@ -172,6 +173,18 @@ function statusLabel(status) {
 
 function emailStatusLabel(status) {
   return status === 'completed' ? 'مكتمل' : status === 'archived' ? 'مؤرشف' : 'نشط';
+}
+
+function isMailTmEmail(email) {
+  return email?.provider !== 'local';
+}
+
+function emailProviderLabel(email) {
+  return isMailTmEmail(email) ? 'Mail.tm' : 'إيميل عادي';
+}
+
+function isValidEmailAddress(address) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/i.test(address);
 }
 
 function getEmail(id) {
@@ -348,39 +361,52 @@ function renderStats() {
 
 function renderHome() {
   const activeEmails = state.emails.filter((email) => email.status === 'active');
+  const completedCount = state.emails.filter((email) => email.status === 'completed').length;
   els.main.innerHTML = `
     ${renderStats()}
+
     <section class="section">
-      <div class="section-head"><div><h2>إضافة إيميل</h2><p>أنشئ حساباً جديداً أو أضف حساب Mail.tm موجوداً</p></div></div>
+      <div class="section-head"><div><h2>إضافة إيميل</h2><p>أنشئ عبر Mail.tm أو أضف أي إيميل عادي</p></div></div>
       <div class="card add-card">
-        <div class="segmented">
+        <div class="segmented add-options">
           <button class="${ui.addMode === 'auto' ? 'active' : ''}" data-action="set-add-mode" data-mode="auto">إنشاء تلقائي</button>
-          <button class="${ui.addMode === 'existing' ? 'active' : ''}" data-action="set-add-mode" data-mode="existing">إضافة موجود</button>
+          <button class="${ui.addMode === 'existing' ? 'active' : ''}" data-action="set-add-mode" data-mode="existing">حساب Mail.tm</button>
+          <button class="${ui.addMode === 'local' ? 'active' : ''}" data-action="set-add-mode" data-mode="local">إيميل عادي</button>
         </div>
+
         ${ui.addMode === 'auto' ? `
           <div class="add-pane">
-            <p class="helper">سيتم اختيار نطاق فعال، وإنشاء اسم وكلمة مرور قوية، ثم حفظ الحساب والبروفايلات الخمسة محلياً.</p>
+            <p class="helper">ينشئ الموقع إيميلاً جديداً من Mail.tm ويحفظ كلمة المرور والرسائل محلياً.</p>
             <button class="btn primary wide" data-action="create-email" ${isBusy('create-email') ? 'disabled' : ''}>
               ${isBusy('create-email') ? '<span class="spinner"></span> جاري إنشاء الإيميل...' : '＋ إنشاء إيميل جديد'}
             </button>
           </div>
+        ` : ui.addMode === 'existing' ? `
+          <div class="add-pane">
+            <p class="helper">أدخل حساب Mail.tm موجوداً وسيتم التحقق منه عبر API قبل الحفظ.</p>
+            <button class="btn primary wide" data-action="open-existing-modal">إضافة حساب Mail.tm</button>
+          </div>
         ` : `
           <div class="add-pane">
-            <p class="helper">أدخل البريد وكلمة المرور، وسيتم التحقق منهما فعلياً عبر Mail.tm قبل الحفظ.</p>
-            <button class="btn primary wide" data-action="open-existing-modal">إضافة إيميل Mail.tm موجود</button>
+            <p class="helper">أضف أي بريد عادي مثل nhyffga@hi2.in لإدارة بروفايلاته الخمسة. الرسائل متاحة لحسابات Mail.tm فقط.</p>
+            <button class="btn primary wide" data-action="open-local-email-modal">إضافة إيميل عادي</button>
           </div>
         `}
       </div>
     </section>
 
     <section class="section">
-      <button class="btn soft wide" data-action="go-sold-emails">الإيميلات المباعة التي اختفت (${state.emails.filter((email) => email.status === 'completed').length})</button>
+      <button class="btn soft wide" data-action="go-sold-emails">الإيميلات المباعة (${completedCount})</button>
     </section>
 
     <section class="section">
-      <div class="section-head"><div><h2>الإيميلات النشطة</h2><p>${activeEmails.length ? 'اضغط على أي إيميل لإدارة بروفايلاته ورسائله' : 'لا توجد حسابات نشطة حالياً'}</p></div></div>
-      <div class="email-list">
-        ${activeEmails.length ? activeEmails.map((email) => emailCard(email, false)).join('') : emptyState('📨', 'لا توجد إيميلات بعد', 'أنشئ أول إيميل أو أضف حساب Mail.tm موجوداً لتبدأ الإدارة.')}
+      <div class="section-head">
+        <div><h2>الإيميلات الحالية</h2><p>${activeEmails.length ? 'ابحث بالإيميل أو افتح الحساب مباشرة' : 'لا توجد إيميلات حالياً'}</p></div>
+        ${activeEmails.length ? '<button class="btn ghost small" data-action="focus-active-search">البحث</button>' : ''}
+      </div>
+      ${activeEmails.length ? '<div class="searchbar"><span>⌕</span><input id="activeEmailSearch" class="input" dir="ltr" data-live-filter="active-email-list" placeholder="ابحث بالإيميل فقط"></div>' : ''}
+      <div id="active-email-list" class="email-list">
+        ${activeEmails.length ? activeEmails.map((email) => emailCard(email, false)).join('') : emptyState('📨', 'لا توجد إيميلات بعد', 'أنشئ إيميلاً من Mail.tm أو أضف أي بريد عادي للبدء.')}
       </div>
     </section>
   `;
@@ -388,31 +414,28 @@ function renderHome() {
 
 function emailCard(email, soldPage = false) {
   const counts = profileCounts(email);
-  const searchable = `${email.address} ${email.localName || ''}`.toLowerCase();
+  const searchable = email.address.toLowerCase();
   return `
     <article class="card email-card" data-search-item="${escapeHTML(searchable)}">
       <div class="email-top">
         <div class="email-title">
-          <h3>${escapeHTML(email.localName || email.address)}</h3>
-          ${email.localName ? `<p>${escapeHTML(email.address)}</p>` : ''}
+          <h3 dir="ltr">${escapeHTML(email.address)}</h3>
           <p>تاريخ الإنشاء: ${formatDate(email.createdAt)}</p>
         </div>
-        <span class="email-badge">${emailStatusLabel(email.status)}</span>
+        <div class="email-badges">
+          <span class="provider-badge ${isMailTmEmail(email) ? 'mailtm' : 'local'}">${emailProviderLabel(email)}</span>
+          <span class="email-badge">${emailStatusLabel(email.status)}</span>
+        </div>
       </div>
       <div class="email-metrics">
         <div class="metric"><b>${counts.available}</b><small>متاح من 5</small></div>
         <div class="metric"><b>${counts.review}</b><small>قيد المراجعة</small></div>
         <div class="metric"><b>${counts.sold}</b><small>تم البيع</small></div>
       </div>
-      <div class="email-actions">
-        <button class="btn primary small" data-action="open-email" data-email-id="${email.localId}" data-return-view="${soldPage ? 'sold-emails' : 'home'}">فتح الحساب</button>
+      <div class="email-actions simple-actions">
+        <button class="btn primary small" data-action="open-email" data-email-id="${email.localId}" data-return-view="${soldPage ? 'sold-emails' : 'home'}">فتح</button>
         <button class="btn soft small" data-action="copy-text" data-copy="${escapeHTML(email.address)}">نسخ الإيميل</button>
-        ${!soldPage ? `
-          <button class="btn ghost small" data-action="rename-email" data-email-id="${email.localId}">تعديل الاسم</button>
-          <button class="btn ghost small" data-action="refresh-token" data-email-id="${email.localId}">تحديث Token</button>
-          <button class="btn ghost small" data-action="archive-email" data-email-id="${email.localId}">أرشفة</button>
-          <button class="btn danger small" data-action="delete-email" data-email-id="${email.localId}">حذف</button>
-        ` : ''}
+        ${!soldPage ? `<button class="btn danger small" data-action="delete-email" data-email-id="${email.localId}">حذف</button>` : ''}
       </div>
     </article>
   `;
@@ -426,10 +449,13 @@ function renderSoldEmails() {
   const completed = state.emails.filter((email) => email.status === 'completed');
   els.main.innerHTML = `
     <section class="section">
-      <div class="section-head"><div><h2>الإيميلات المباعة</h2><p>الإيميلات التي تم بيع بروفايلاتها الخمسة واختفت من الواجهة الرئيسية</p></div><button class="btn soft small" data-action="focus-sold-search">البحث</button></div>
-      <div class="searchbar"><span>⌕</span><input id="soldEmailSearch" class="input" data-live-filter="sold-email-list" placeholder="ابحث عن الإيميل أو الاسم المحلي"></div>
+      <div class="section-head">
+        <div><h2>الإيميلات المباعة</h2><p>الإيميلات التي تم بيع بروفايلاتها الخمسة</p></div>
+        ${completed.length ? '<button class="btn ghost small" data-action="focus-sold-search">البحث</button>' : ''}
+      </div>
+      ${completed.length ? '<div class="searchbar"><span>⌕</span><input id="soldEmailSearch" class="input" dir="ltr" data-live-filter="sold-email-list" placeholder="ابحث بالإيميل فقط"></div>' : ''}
       <div id="sold-email-list" class="email-list">
-        ${completed.length ? completed.map((email) => emailCard(email, true)).join('') : emptyState('✅', 'لا توجد إيميلات مكتملة', 'عندما تُباع البروفايلات الخمسة سيظهر الإيميل هنا مع تاريخ إنشائه وكل معلوماته.')}
+        ${completed.length ? completed.map((email) => emailCard(email, true)).join('') : emptyState('✅', 'لا توجد إيميلات مباعة', 'عندما تُباع البروفايلات الخمسة سيظهر الإيميل هنا مع تاريخ إنشائه وملفاته.')}
       </div>
     </section>
   `;
@@ -445,36 +471,44 @@ function renderEmailDetail() {
   state.lastEmailId = email.localId;
   saveState({ silent: true });
   const counts = profileCounts(email);
+  const mailTm = isMailTmEmail(email);
   const soldMode = email.status === 'completed' || ui.returnView === 'sold-emails';
   const shownProfiles = soldMode ? email.profiles : email.profiles.filter((p) => p.status !== 'sold');
+
   els.main.innerHTML = `
     <div class="detail-header">
       <button class="back-btn" data-action="back-from-email" aria-label="رجوع">‹</button>
-      <div><h2>${escapeHTML(email.localName || email.address)}</h2><p>${escapeHTML(email.address)} · تاريخ الإنشاء: ${formatDate(email.createdAt)}</p></div>
+      <div><h2 dir="ltr">${escapeHTML(email.address)}</h2><p>${emailProviderLabel(email)} · تاريخ الإنشاء: ${formatDate(email.createdAt)}</p></div>
     </div>
 
     <section class="card account-summary">
       <div class="info-line"><span>حالة الحساب</span><strong>${emailStatusLabel(email.status)}</strong></div>
       <div class="info-line"><span>البروفايلات</span><strong>متاح ${counts.available} · مراجعة ${counts.review} · مباع ${counts.sold}</strong></div>
-      <div class="info-line"><span>كلمة مرور Mail.tm</span>
-        <div class="inline-actions"><strong data-password-value>${state.settings.showPasswords ? escapeHTML(email.password) : '••••••••••••'}</strong><button class="btn ghost small" data-action="copy-text" data-copy="${escapeHTML(email.password)}">نسخ</button></div>
-      </div>
+      ${mailTm ? `
+        <div class="info-line"><span>كلمة مرور Mail.tm</span>
+          <div class="inline-actions"><strong data-password-value>${state.settings.showPasswords ? escapeHTML(email.password) : '••••••••••••'}</strong><button class="btn ghost small" data-action="copy-text" data-copy="${escapeHTML(email.password)}">نسخ</button></div>
+        </div>
+      ` : ''}
       <div class="btn-row" style="margin-top:12px">
-        <button class="btn primary" data-action="fetch-code" data-email-id="${email.localId}">جلب الكود</button>
-        <button class="btn soft" data-action="open-inbox" data-email-id="${email.localId}">صندوق الوارد</button>
-        <button class="btn ghost" data-action="change-profile-icons" data-email-id="${email.localId}">تغيير رموز البروفايلات</button>
+        ${mailTm ? `
+          <button class="btn primary" data-action="fetch-code" data-email-id="${email.localId}">جلب الكود</button>
+          <button class="btn soft" data-action="open-inbox" data-email-id="${email.localId}">صندوق الوارد</button>
+        ` : ''}
+        <button class="btn ghost" data-action="change-profile-icons" data-email-id="${email.localId}">تغيير الرموز</button>
         <button class="btn ghost" data-action="copy-text" data-copy="${escapeHTML(email.address)}">نسخ الإيميل</button>
       </div>
     </section>
 
+    ${!mailTm ? '<div class="notice local-email-notice">هذا إيميل عادي محفوظ محلياً لإدارة البروفايلات فقط. جلب الرسائل والكود يعمل مع حسابات Mail.tm.</div>' : ''}
+
     <section class="section">
-      <div class="section-head"><div><h2>${soldMode ? 'الملفات الخمسة المباعة' : 'البروفايلات المتاحة وقيد المراجعة'}</h2><p>التسلسل ثابت دائماً من 1 إلى 5</p></div></div>
+      <div class="section-head"><div><h2>${soldMode ? 'الملفات الخمسة المباعة' : 'البروفايلات'}</h2><p>الترتيب ثابت دائماً: 1 ثم 2 ثم 3 ثم 4 ثم 5</p></div></div>
       <div class="profile-grid">
         ${shownProfiles.length ? shownProfiles.sort((a,b) => a.number - b.number).map((profile) => profileCard(email, profile)).join('') : emptyState('🎉', 'تم بيع جميع البروفايلات', 'تم نقل هذا الإيميل تلقائياً إلى صفحة الإيميلات المباعة.')}
       </div>
     </section>
 
-    ${soldMode ? `<div class="notice">هذا الإيميل مكتمل. يمكنك فتح أي بروفايل لمشاهدة الرمز، الرقم السري، العميل، تاريخ البيع والملاحظات، أو استرجاع البروفايل عند الحاجة.</div>` : ''}
+    ${soldMode ? '<div class="notice">هذا الإيميل مكتمل. افتح أي بروفايل لمشاهدة الرمز والرقم السري ومعلومات العميل أو لاسترجاعه.</div>' : ''}
   `;
 }
 
@@ -865,6 +899,7 @@ function apiErrorMessage(status, data) {
 }
 
 async function refreshEmailToken(email, showSuccess = false) {
+  if (!isMailTmEmail(email)) throw new Error('هذا إيميل عادي ولا يرتبط بخدمة Mail.tm.');
   if (!email?.address || !email?.password) throw new Error('لا توجد كلمة مرور محفوظة لهذا الإيميل.');
   const { data } = await fetchJson(`${API_BASE}/token`, {
     method: 'POST',
@@ -880,6 +915,7 @@ async function refreshEmailToken(email, showSuccess = false) {
 }
 
 async function apiForEmail(email, path, options = {}, retry401 = true) {
+  if (!isMailTmEmail(email)) throw new Error('هذا إيميل عادي ولا يمكن جلب رسائله عبر Mail.tm.');
   const headers = new Headers(options.headers || {});
   headers.set('Accept', 'application/json');
   if (email.token) headers.set('Authorization', `Bearer ${email.token}`);
@@ -913,7 +949,7 @@ function randomUsername() {
   return `cd${random}${time}`;
 }
 
-function buildEmailRecord({ mailTmId, address, password, token, createdAt = new Date().toISOString() }) {
+function buildEmailRecord({ mailTmId, address, password, token, provider = 'mailtm', createdAt = new Date().toISOString() }) {
   const profiles = [1,2,3,4,5].map(createDefaultProfile);
   if (state.globalProfileStyles) {
     profiles.forEach((profile) => {
@@ -922,7 +958,7 @@ function buildEmailRecord({ mailTmId, address, password, token, createdAt = new 
     });
   }
   return {
-    localId: makeId(), mailTmId: mailTmId || '', address, password, token,
+    localId: makeId(), mailTmId: mailTmId || '', address, password: password || '', token: token || '', provider,
     localName: '', createdAt, status: 'active', archivedAt: null, completedAt: null,
     archivedMessageIds: [], profiles
   };
@@ -1025,6 +1061,37 @@ async function saveExistingAccount() {
   }
 }
 
+async function saveLocalEmail() {
+  const address = document.getElementById('localEmailAddress')?.value.trim().toLowerCase() || '';
+  const errorEl = document.getElementById('localEmailError');
+  if (!isValidEmailAddress(address)) {
+    if (errorEl) errorEl.textContent = 'أدخل بريداً إلكترونياً صحيحاً، مثل nhyffga@hi2.in';
+    return;
+  }
+  if (state.emails.some((email) => email.address.toLowerCase() === address)) {
+    if (errorEl) errorEl.textContent = 'هذا الإيميل محفوظ مسبقاً.';
+    return;
+  }
+
+  const email = buildEmailRecord({
+    address,
+    password: '',
+    token: '',
+    mailTmId: '',
+    provider: 'local',
+    createdAt: new Date().toISOString()
+  });
+  state.emails.unshift(email);
+  state.lastEmailId = email.localId;
+  if (!saveState()) return;
+  closeModal();
+  toast('تمت إضافة الإيميل العادي بنجاح.');
+  ui.selectedEmailId = email.localId;
+  ui.returnView = 'home';
+  ui.view = 'email-detail';
+  render();
+}
+
 async function copyText(text, notify = true) {
   if (!text) return;
   try {
@@ -1058,6 +1125,7 @@ async function fetchMessages(email, { updateUi = true } = {}) {
 async function openInbox(emailId) {
   const email = getEmail(emailId);
   if (!email) return;
+  if (!isMailTmEmail(email)) { toast('صندوق الوارد متاح لحسابات Mail.tm فقط.', 'info'); return; }
   ui.inboxEmailId = emailId;
   ui.inboxFilter = 'all';
   ui.inboxSearch = '';
@@ -1121,6 +1189,7 @@ async function openMessage(messageId, archiveId = '') {
 async function fetchLatestCode(emailId) {
   const email = getEmail(emailId);
   if (!email) return;
+  if (!isMailTmEmail(email)) { toast('جلب الكود متاح لحسابات Mail.tm فقط.', 'info'); return; }
   openSheet(`
     <div class="sheet-title"><h2>جلب الكود</h2><button class="close-btn" data-action="close-sheet">×</button></div>
     <div class="skeleton" style="height:96px"></div><p class="helper" style="text-align:center">جاري البحث عن الرسائل...</p>
@@ -1474,8 +1543,8 @@ async function compressImage(file) {
 
 function openExistingModal() {
   openModal(`
-    <h2>إضافة إيميل Mail.tm موجود</h2>
-    <p>سيتم التحقق من البيانات فعلياً عبر API ولن يُحفظ الحساب إذا كانت المعلومات خاطئة.</p>
+    <h2>إضافة حساب Mail.tm</h2>
+    <p>أدخل البريد وكلمة المرور. سيتم التحقق منهما عبر API قبل حفظ الحساب.</p>
     <div class="form-grid">
       <div class="field"><label>البريد الإلكتروني</label><input id="existingEmail" class="input" type="email" dir="ltr" autocomplete="username" placeholder="name@domain.com"></div>
       <div class="field"><label>كلمة المرور</label><input id="existingPassword" class="input" type="password" dir="ltr" autocomplete="current-password" placeholder="كلمة المرور"></div>
@@ -1484,6 +1553,20 @@ function openExistingModal() {
       <button class="btn ghost wide" data-action="close-modal">إلغاء</button>
     </div>
   `);
+}
+
+function openLocalEmailModal() {
+  openModal(`
+    <h2>إضافة إيميل عادي</h2>
+    <p>سيُحفظ البريد محلياً مع خمسة بروفايلات، من دون محاولة تسجيل الدخول إلى Mail.tm.</p>
+    <div class="form-grid">
+      <div class="field"><label>البريد الإلكتروني</label><input id="localEmailAddress" class="input" type="email" dir="ltr" autocomplete="off" placeholder="nhyffga@hi2.in"></div>
+      <p id="localEmailError" class="form-error"></p>
+      <button class="btn primary wide" data-action="save-local-email">حفظ الإيميل</button>
+      <button class="btn ghost wide" data-action="close-modal">إلغاء</button>
+    </div>
+  `);
+  requestAnimationFrame(() => document.getElementById('localEmailAddress')?.focus());
 }
 
 async function renameEmail(emailId) {
@@ -1512,17 +1595,28 @@ async function archiveEmail(emailId) {
 async function deleteEmail(emailId) {
   const email = getEmail(emailId);
   if (!email) return;
-  const choice = await choiceDialog({
-    title:'حذف الإيميل',
-    message:'اختر هل تريد حذف الحساب من الموقع فقط، أم حذفه نهائياً من Mail.tm أيضاً.',
-    choices:[
-      { value:'local', label:'حذف من الموقع فقط', className:'warning' },
-      { value:'remote', label:'حذف نهائياً من Mail.tm والموقع', className:'danger' }
-    ]
+
+  let choice = 'local';
+  if (isMailTmEmail(email)) {
+    choice = await choiceDialog({
+      title:'حذف الإيميل',
+      message:'احذفه من الموقع فقط، أو احذفه نهائياً من Mail.tm أيضاً.',
+      choices:[
+        { value:'local', label:'حذف من الموقع فقط', className:'warning' },
+        { value:'remote', label:'حذف من Mail.tm والموقع', className:'danger' }
+      ]
+    });
+    if (!['local','remote'].includes(choice)) return;
+  }
+
+  const confirm = await confirmDialog({
+    title:'تأكيد الحذف',
+    message: choice === 'remote' ? 'سيتم حذف الحساب نهائياً من Mail.tm ولا يمكن التراجع.' : 'سيتم حذف الإيميل وكل بياناته المحلية من هذا المتصفح.',
+    confirmText:'حذف الإيميل',
+    danger:true
   });
-  if (!['local','remote'].includes(choice)) return;
-  const confirm = await confirmDialog({ title:'تأكيد الحذف', message: choice === 'remote' ? 'سيتم حذف الحساب نهائياً من Mail.tm، ولا يمكن التراجع.' : 'سيتم حذف الحساب وكل بياناته المحلية من هذا المتصفح.', confirmText:'تنفيذ الحذف', danger:true });
   if (confirm !== 'confirm') return;
+
   try {
     if (choice === 'remote') {
       if (!email.mailTmId) throw new Error('لا يتوفر ID الحساب المطلوب للحذف النهائي.');
@@ -1534,9 +1628,11 @@ async function deleteEmail(emailId) {
     state.recoveredProfiles = state.recoveredProfiles.filter((item) => item.emailId !== email.localId);
     if (state.lastEmailId === email.localId) state.lastEmailId = state.emails.find((item) => item.status === 'active')?.localId || null;
     saveState();
-    toast(choice === 'remote' ? 'تم حذف الحساب نهائياً.' : 'تم حذف الحساب من الموقع.');
-    goView(email.status === 'archived' ? 'archive' : 'home');
-  } catch (error) { toast(error.message || 'تعذر حذف الحساب.', 'error', 6000); }
+    toast(choice === 'remote' ? 'تم حذف الحساب نهائياً.' : 'تم حذف الإيميل من الموقع.');
+    goView(email.status === 'completed' ? 'sold-emails' : 'home');
+  } catch (error) {
+    toast(error.message || 'تعذر حذف الحساب.', 'error', 6000);
+  }
 }
 
 async function hashPin(pin) {
@@ -1717,10 +1813,13 @@ async function handleClick(event) {
       case 'go-settings': goView('settings'); break;
       case 'go-sold-emails': goView('sold-emails'); break;
       case 'focus-sold-search': document.getElementById('soldEmailSearch')?.focus(); break;
+      case 'focus-active-search': document.getElementById('activeEmailSearch')?.focus(); break;
       case 'set-add-mode': ui.addMode = target.dataset.mode; renderHome(); break;
       case 'create-email': await createMailAccount(); break;
       case 'open-existing-modal': openExistingModal(); break;
+      case 'open-local-email-modal': openLocalEmailModal(); break;
       case 'save-existing-account': await saveExistingAccount(); break;
+      case 'save-local-email': await saveLocalEmail(); break;
       case 'close-modal': closeModal('cancel'); break;
       case 'close-sheet': closeSheet(); break;
       case 'copy-text': await copyText(target.dataset.copy || ''); break;
