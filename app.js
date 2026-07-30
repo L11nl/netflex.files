@@ -3,6 +3,7 @@
 /* تطبيق ثابت بالكامل: جميع البيانات تحفظ داخل LocalStorage فقط. */
 const STORAGE_KEY = 'cd-mail-profile-manager-v1';
 const API_BASE = 'https://api.mail.tm';
+const FALLBACK_MAILTM_DOMAINS = ['deltajohnsons.com'];
 const DEFAULT_PINS = ['1212', '1001', '2121', '2026', '2002'];
 const DEFAULT_COLORS = ['#0A84FF', '#FFD60A', '#FF3B30', '#00677A', '#30D18A'];
 const READY_ICONS = ['face', 'star', 'crown', 'heart', 'bolt'];
@@ -165,6 +166,23 @@ function formatDate(value, withTime = true) {
     dateStyle: 'medium',
     ...(withTime ? { timeStyle: 'short' } : {})
   }).format(date);
+}
+
+function formatAccountAge(value) {
+  if (!value) return 'تاريخ الإنشاء غير معروف';
+  const created = new Date(value);
+  if (Number.isNaN(created.getTime())) return 'تاريخ الإنشاء غير معروف';
+
+  const now = new Date();
+  const startToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const startCreated = new Date(created.getFullYear(), created.getMonth(), created.getDate());
+  const days = Math.max(0, Math.floor((startToday - startCreated) / 86400000));
+
+  if (days === 0) return 'تاريخ الإنشاء: اليوم';
+  if (days === 1) return 'تم إنشاء هذا الحساب قبل يوم واحد';
+  if (days === 2) return 'تم إنشاء هذا الحساب قبل يومين';
+  if (days >= 3 && days <= 10) return `تم إنشاء هذا الحساب قبل ${days} أيام`;
+  return `تم إنشاء هذا الحساب قبل ${days} يوماً`;
 }
 
 function statusLabel(status) {
@@ -361,76 +379,37 @@ function renderStats() {
 
 function renderHome() {
   const activeEmails = state.emails.filter((email) => email.status === 'active');
-  const completedCount = state.emails.filter((email) => email.status === 'completed').length;
   els.main.innerHTML = `
-    ${renderStats()}
-
     <section class="section">
-      <div class="section-head"><div><h2>إضافة إيميل</h2><p>أنشئ عبر Mail.tm أو أضف أي إيميل عادي</p></div></div>
-      <div class="card add-card">
-        <div class="segmented add-options">
-          <button class="${ui.addMode === 'auto' ? 'active' : ''}" data-action="set-add-mode" data-mode="auto">إنشاء تلقائي</button>
-          <button class="${ui.addMode === 'existing' ? 'active' : ''}" data-action="set-add-mode" data-mode="existing">حساب Mail.tm</button>
-          <button class="${ui.addMode === 'local' ? 'active' : ''}" data-action="set-add-mode" data-mode="local">إيميل عادي</button>
-        </div>
-
-        ${ui.addMode === 'auto' ? `
-          <div class="add-pane">
-            <p class="helper">ينشئ الموقع إيميلاً جديداً من Mail.tm ويحفظ كلمة المرور والرسائل محلياً.</p>
-            <button class="btn primary wide" data-action="create-email" ${isBusy('create-email') ? 'disabled' : ''}>
-              ${isBusy('create-email') ? '<span class="spinner"></span> جاري إنشاء الإيميل...' : '＋ إنشاء إيميل جديد'}
-            </button>
-          </div>
-        ` : ui.addMode === 'existing' ? `
-          <div class="add-pane">
-            <p class="helper">أدخل حساب Mail.tm موجوداً وسيتم التحقق منه عبر API قبل الحفظ.</p>
-            <button class="btn primary wide" data-action="open-existing-modal">إضافة حساب Mail.tm</button>
-          </div>
-        ` : `
-          <div class="add-pane">
-            <p class="helper">أضف أي بريد عادي مثل nhyffga@hi2.in لإدارة بروفايلاته الخمسة. الرسائل متاحة لحسابات Mail.tm فقط.</p>
-            <button class="btn primary wide" data-action="open-local-email-modal">إضافة إيميل عادي</button>
-          </div>
-        `}
+      <div class="section-head"><div><h2>إضافة إيميل</h2><p>اختر الطريقة المناسبة</p></div></div>
+      <div class="card add-card simple-add-card">
+        <button class="btn primary wide" data-action="create-email" ${isBusy('create-email') ? 'disabled' : ''}>
+          ${isBusy('create-email') ? '<span class="spinner"></span> جاري إنشاء الإيميل...' : '＋ إنشاء إيميل تلقائي'}
+        </button>
+        <button class="btn soft wide" data-action="open-local-email-modal">＋ إضافة إيميل</button>
       </div>
-    </section>
-
-    <section class="section">
-      <button class="btn soft wide" data-action="go-sold-emails">الإيميلات المباعة (${completedCount})</button>
     </section>
 
     <section class="section">
       <div class="section-head">
-        <div><h2>الإيميلات الحالية</h2><p>${activeEmails.length ? 'ابحث بالإيميل أو افتح الحساب مباشرة' : 'لا توجد إيميلات حالياً'}</p></div>
+        <div><h2>الإيميلات الحالية</h2><p>${activeEmails.length ? 'افتح الإيميل أو ابحث عنه' : 'لا توجد إيميلات حالياً'}</p></div>
         ${activeEmails.length ? '<button class="btn ghost small" data-action="focus-active-search">البحث</button>' : ''}
       </div>
-      ${activeEmails.length ? '<div class="searchbar"><span>⌕</span><input id="activeEmailSearch" class="input" dir="ltr" data-live-filter="active-email-list" placeholder="ابحث بالإيميل فقط"></div>' : ''}
+      ${activeEmails.length ? '<div class="searchbar"><span>⌕</span><input id="activeEmailSearch" class="input" dir="ltr" data-live-filter="active-email-list" placeholder="ابحث بالإيميل"></div>' : ''}
       <div id="active-email-list" class="email-list">
-        ${activeEmails.length ? activeEmails.map((email) => emailCard(email, false)).join('') : emptyState('📨', 'لا توجد إيميلات بعد', 'أنشئ إيميلاً من Mail.tm أو أضف أي بريد عادي للبدء.')}
+        ${activeEmails.length ? activeEmails.map((email) => emailCard(email, false)).join('') : emptyState('📨', 'لا توجد إيميلات بعد', 'أنشئ إيميلاً تلقائياً أو أضف إيميلاً للبدء.')}
       </div>
     </section>
   `;
 }
 
 function emailCard(email, soldPage = false) {
-  const counts = profileCounts(email);
   const searchable = email.address.toLowerCase();
   return `
-    <article class="card email-card" data-search-item="${escapeHTML(searchable)}">
-      <div class="email-top">
-        <div class="email-title">
-          <h3 dir="ltr">${escapeHTML(email.address)}</h3>
-          <p>تاريخ الإنشاء: ${formatDate(email.createdAt)}</p>
-        </div>
-        <div class="email-badges">
-          <span class="provider-badge ${isMailTmEmail(email) ? 'mailtm' : 'local'}">${emailProviderLabel(email)}</span>
-          <span class="email-badge">${emailStatusLabel(email.status)}</span>
-        </div>
-      </div>
-      <div class="email-metrics">
-        <div class="metric"><b>${counts.available}</b><small>متاح من 5</small></div>
-        <div class="metric"><b>${counts.review}</b><small>قيد المراجعة</small></div>
-        <div class="metric"><b>${counts.sold}</b><small>تم البيع</small></div>
+    <article class="card email-card simple-email-card" data-search-item="${escapeHTML(searchable)}">
+      <div class="email-title">
+        <h3 dir="ltr">${escapeHTML(email.address)}</h3>
+        <p>${formatAccountAge(email.createdAt)}</p>
       </div>
       <div class="email-actions simple-actions">
         <button class="btn primary small" data-action="open-email" data-email-id="${email.localId}" data-return-view="${soldPage ? 'sold-emails' : 'home'}">فتح</button>
@@ -450,12 +429,12 @@ function renderSoldEmails() {
   els.main.innerHTML = `
     <section class="section">
       <div class="section-head">
-        <div><h2>الإيميلات المباعة</h2><p>الإيميلات التي تم بيع بروفايلاتها الخمسة</p></div>
+        <div><h2>الإيميلات المباعة</h2><p>تظهر هنا الإيميلات المكتملة فقط</p></div>
         ${completed.length ? '<button class="btn ghost small" data-action="focus-sold-search">البحث</button>' : ''}
       </div>
-      ${completed.length ? '<div class="searchbar"><span>⌕</span><input id="soldEmailSearch" class="input" dir="ltr" data-live-filter="sold-email-list" placeholder="ابحث بالإيميل فقط"></div>' : ''}
+      ${completed.length ? '<div class="searchbar"><span>⌕</span><input id="soldEmailSearch" class="input" dir="ltr" data-live-filter="sold-email-list" placeholder="ابحث بالإيميل"></div>' : ''}
       <div id="sold-email-list" class="email-list">
-        ${completed.length ? completed.map((email) => emailCard(email, true)).join('') : emptyState('✅', 'لا توجد إيميلات مباعة', 'عندما تُباع البروفايلات الخمسة سيظهر الإيميل هنا مع تاريخ إنشائه وملفاته.')}
+        ${completed.length ? completed.map((email) => emailCard(email, true)).join('') : emptyState('✅', 'لا توجد إيميلات مباعة', 'عندما تُباع البروفايلات الخمسة سيظهر الإيميل هنا.')}
       </div>
     </section>
   `;
@@ -470,7 +449,6 @@ function renderEmailDetail() {
   }
   state.lastEmailId = email.localId;
   saveState({ silent: true });
-  const counts = profileCounts(email);
   const mailTm = isMailTmEmail(email);
   const soldMode = email.status === 'completed' || ui.returnView === 'sold-emails';
   const shownProfiles = soldMode ? email.profiles : email.profiles.filter((p) => p.status !== 'sold');
@@ -478,37 +456,24 @@ function renderEmailDetail() {
   els.main.innerHTML = `
     <div class="detail-header">
       <button class="back-btn" data-action="back-from-email" aria-label="رجوع">‹</button>
-      <div><h2 dir="ltr">${escapeHTML(email.address)}</h2><p>${emailProviderLabel(email)} · تاريخ الإنشاء: ${formatDate(email.createdAt)}</p></div>
+      <div><h2 dir="ltr">${escapeHTML(email.address)}</h2><p>${formatAccountAge(email.createdAt)}</p></div>
     </div>
 
-    <section class="card account-summary">
-      <div class="info-line"><span>حالة الحساب</span><strong>${emailStatusLabel(email.status)}</strong></div>
-      <div class="info-line"><span>البروفايلات</span><strong>متاح ${counts.available} · مراجعة ${counts.review} · مباع ${counts.sold}</strong></div>
-      ${mailTm ? `
-        <div class="info-line"><span>كلمة مرور Mail.tm</span>
-          <div class="inline-actions"><strong data-password-value>${state.settings.showPasswords ? escapeHTML(email.password) : '••••••••••••'}</strong><button class="btn ghost small" data-action="copy-text" data-copy="${escapeHTML(email.password)}">نسخ</button></div>
-        </div>
-      ` : ''}
-      <div class="btn-row" style="margin-top:12px">
-        ${mailTm ? `
-          <button class="btn primary" data-action="fetch-code" data-email-id="${email.localId}">جلب الكود</button>
-          <button class="btn soft" data-action="open-inbox" data-email-id="${email.localId}">صندوق الوارد</button>
-        ` : ''}
+    <section class="card account-summary simple-account-summary">
+      <div class="simple-account-actions">
+        <button class="btn soft" data-action="copy-text" data-copy="${escapeHTML(email.address)}">نسخ الإيميل</button>
+        <button class="btn primary" data-action="fetch-code" data-email-id="${email.localId}">جلب الكود</button>
         <button class="btn ghost" data-action="change-profile-icons" data-email-id="${email.localId}">تغيير الرموز</button>
-        <button class="btn ghost" data-action="copy-text" data-copy="${escapeHTML(email.address)}">نسخ الإيميل</button>
       </div>
+      ${!mailTm ? '<p class="helper simple-note">هذا الإيميل مضاف للتنظيم فقط، لذلك جلب الكود يحتاج حساباً تم إنشاؤه تلقائياً من Mail.tm.</p>' : ''}
     </section>
-
-    ${!mailTm ? '<div class="notice local-email-notice">هذا إيميل عادي محفوظ محلياً لإدارة البروفايلات فقط. جلب الرسائل والكود يعمل مع حسابات Mail.tm.</div>' : ''}
 
     <section class="section">
-      <div class="section-head"><div><h2>${soldMode ? 'الملفات الخمسة المباعة' : 'البروفايلات'}</h2><p>الترتيب ثابت دائماً: 1 ثم 2 ثم 3 ثم 4 ثم 5</p></div></div>
+      <div class="section-head"><div><h2>${soldMode ? 'الملفات الخمسة' : 'البروفايلات'}</h2><p>الترتيب: 1 ثم 2 ثم 3 ثم 4 ثم 5</p></div></div>
       <div class="profile-grid">
-        ${shownProfiles.length ? shownProfiles.sort((a,b) => a.number - b.number).map((profile) => profileCard(email, profile)).join('') : emptyState('🎉', 'تم بيع جميع البروفايلات', 'تم نقل هذا الإيميل تلقائياً إلى صفحة الإيميلات المباعة.')}
+        ${shownProfiles.length ? shownProfiles.sort((a,b) => a.number - b.number).map((profile) => profileCard(email, profile)).join('') : emptyState('🎉', 'تم بيع جميع البروفايلات', 'ستجد هذا الإيميل في صفحة الإيميلات المباعة.')}
       </div>
     </section>
-
-    ${soldMode ? '<div class="notice">هذا الإيميل مكتمل. افتح أي بروفايل لمشاهدة الرمز والرقم السري ومعلومات العميل أو لاسترجاعه.</div>' : ''}
   `;
 }
 
@@ -650,25 +615,15 @@ function openProfileSheet(emailId, profileNumber) {
   state.lastProfileRef = { emailId, profileNumber: profile.number };
   saveState({ silent: true });
   openSheet(`
-    <div class="sheet-title"><h2>تفاصيل البروفايل ${profile.number}</h2><button class="close-btn" data-action="close-sheet">×</button></div>
-    <div style="display:grid;place-items:center;margin-bottom:14px">${profileVisual(profile)}</div>
-    <div class="card" style="padding:13px;margin-bottom:13px">
-      <div class="info-line"><span>الإيميل المرتبط</span><strong>${escapeHTML(email.address)}</strong></div>
-      <div class="info-line"><span>الحالة</span><strong>${statusLabel(profile.status)}${profile.status === 'review' ? ' · بانتظار الدفع' : ''}</strong></div>
-      <div class="info-line"><span>تاريخ تغيير الحالة</span><strong>${formatDate(profile.statusChangedAt)}</strong></div>
-      ${profile.reservedAt ? `<div class="info-line"><span>تاريخ الحجز</span><strong>${formatDate(profile.reservedAt)}</strong></div>` : ''}
-      ${profile.soldAt ? `<div class="info-line"><span>تاريخ البيع</span><strong>${formatDate(profile.soldAt)}</strong></div>` : ''}
+    <div class="sheet-title"><h2>البروفايل ${profile.number}</h2><button class="close-btn" data-action="close-sheet">×</button></div>
+    <div class="profile-sheet-visual">${profileVisual(profile)}</div>
+    <div class="profile-quick-actions">
+      <button class="btn primary wide" data-action="copy-text" data-copy="${escapeHTML(profile.pin)}">نسخ الرمز</button>
+      <button class="btn soft wide" data-action="copy-text" data-copy="${escapeHTML(email.address)}">نسخ الإيميل</button>
+      <button class="btn ghost wide" data-action="fetch-code" data-email-id="${email.localId}">جلب الكود</button>
     </div>
-
-    <div class="form-grid" data-profile-form data-email-id="${email.localId}" data-profile-number="${profile.number}">
-      <div class="field"><label>الرقم السري</label>
-        <div class="password-box"><input id="profilePin" class="input autosave-profile" data-field="pin" type="${state.settings.showPasswords ? 'text' : 'password'}" inputmode="numeric" maxlength="12" value="${escapeHTML(profile.pin)}"><button class="btn ghost small" data-action="toggle-profile-pin">إظهار</button><button class="btn soft small" data-action="copy-text" data-copy="${escapeHTML(profile.pin)}">نسخ</button></div>
-      </div>
-      <div class="btn-row"><button class="btn ghost small" data-action="reset-profile-pin" data-email-id="${email.localId}" data-profile-number="${profile.number}">استرجاع الرقم الافتراضي</button><button class="btn soft small" data-action="copy-profile-data" data-email-id="${email.localId}" data-profile-number="${profile.number}">نسخ الإيميل والرقم</button></div>
-      <div class="field"><label>اسم العميل (اختياري)</label><input class="input autosave-profile" data-field="customerName" value="${escapeHTML(profile.customerName)}" placeholder="اسم العميل"></div>
-      <div class="field"><label>رقم العميل (اختياري)</label><input class="input autosave-profile" data-field="customerPhone" value="${escapeHTML(profile.customerPhone)}" inputmode="tel" placeholder="رقم الهاتف أو المعرف"></div>
-      <div class="field"><label>ملاحظات</label><textarea class="textarea autosave-profile" data-field="notes" placeholder="أي تفاصيل إضافية">${escapeHTML(profile.notes)}</textarea></div>
-      <button class="btn primary wide" data-action="save-profile" data-email-id="${email.localId}" data-profile-number="${profile.number}">حفظ التعديلات</button>
+    <div class="simple-status-block">
+      <span>الحالة الحالية: <strong>${statusLabel(profile.status)}</strong></span>
       ${profileStatusActions(email, profile)}
     </div>
   `);
@@ -676,12 +631,12 @@ function openProfileSheet(emailId, profileNumber) {
 
 function profileStatusActions(email, profile) {
   if (profile.status === 'available') {
-    return `<button class="btn warning wide" data-action="mark-review" data-email-id="${email.localId}" data-profile-number="${profile.number}">نقل إلى قيد المراجعة</button><button class="btn success wide" data-action="mark-sold" data-email-id="${email.localId}" data-profile-number="${profile.number}">تم البيع</button>`;
+    return `<div class="simple-status-actions"><button class="btn warning wide" data-action="mark-review" data-email-id="${email.localId}" data-profile-number="${profile.number}">قيد المراجعة</button><button class="btn success wide" data-action="mark-sold" data-email-id="${email.localId}" data-profile-number="${profile.number}">تم البيع</button></div>`;
   }
   if (profile.status === 'review') {
-    return `<div class="notice">هذا البروفايل محجوز حالياً وبانتظار الدفع.</div><button class="btn success wide" data-action="mark-sold" data-email-id="${email.localId}" data-profile-number="${profile.number}">تم البيع</button><button class="btn ghost wide" data-action="cancel-review" data-email-id="${email.localId}" data-profile-number="${profile.number}">إلغاء الحجز وإعادته متاحاً</button>`;
+    return `<div class="simple-status-actions"><button class="btn success wide" data-action="mark-sold" data-email-id="${email.localId}" data-profile-number="${profile.number}">تم البيع</button><button class="btn ghost wide" data-action="cancel-review" data-email-id="${email.localId}" data-profile-number="${profile.number}">إلغاء المراجعة</button></div>`;
   }
-  return `<button class="btn warning wide" data-action="restore-profile" data-email-id="${email.localId}" data-profile-number="${profile.number}">استرجاع البروفايل</button>`;
+  return `<div class="simple-status-actions"><button class="btn warning wide" data-action="restore-profile" data-email-id="${email.localId}" data-profile-number="${profile.number}">استرجاع البروفايل</button></div>`;
 }
 
 function openProfileEditor(emailId = null, globalMode = false) {
@@ -860,6 +815,35 @@ function extractVerificationCode(detail) {
   return scored[0]?.code || '';
 }
 
+function extractFourDigitCode(detail) {
+  const sources = [
+    { value: detail?.verifications, priority: 100 },
+    { value: detail?.subject, priority: 80 },
+    { value: detail?.text, priority: 70 },
+    { value: detail?.intro, priority: 60 },
+    { value: Array.isArray(detail?.html) ? detail.html.join(' ') : stripHtml(detail?.html || ''), priority: 50 }
+  ];
+  const currentYear = new Date().getFullYear();
+  const candidates = [];
+
+  for (const source of sources) {
+    if (source.value === null || source.value === undefined) continue;
+    const text = typeof source.value === 'string' ? source.value : JSON.stringify(source.value);
+    for (const match of text.matchAll(/(?<!\d)(\d{4})(?!\d)/g)) {
+      const code = match[1];
+      const number = Number(code);
+      const around = text.slice(Math.max(0, match.index - 40), match.index + 44).toLowerCase();
+      let score = source.priority;
+      if (/code|otp|verify|verification|رمز|كود|تحقق|تأكيد|security/.test(around)) score += 35;
+      if (/phone|tel|mobile|هاتف|واتساب|whatsapp/.test(around)) score -= 30;
+      if (number >= 1900 && number <= currentYear + 5) score -= 70;
+      candidates.push({ code, score });
+    }
+  }
+  candidates.sort((a, b) => b.score - a.score);
+  return candidates.find((item) => item.score > 20)?.code || '';
+}
+
 async function fetchJson(url, options = {}, timeoutMs = 22000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -964,45 +948,95 @@ function buildEmailRecord({ mailTmId, address, password, token, provider = 'mail
   };
 }
 
+function extractDomainItems(data) {
+  if (Array.isArray(data)) return data;
+  if (!data || typeof data !== 'object') return [];
+  if (Array.isArray(data['hydra:member'])) return data['hydra:member'];
+  if (Array.isArray(data.member)) return data.member;
+  if (Array.isArray(data.domains)) return data.domains;
+  if (Array.isArray(data.data)) return data.data;
+  return [];
+}
+
+function isUsableMailTmDomain(item) {
+  if (!item?.domain) return false;
+  const active = ![false, 0, '0', 'false'].includes(item.isActive);
+  const isPrivate = [true, 1, '1', 'true'].includes(item.isPrivate);
+  return active && !isPrivate;
+}
+
+async function getMailTmDomains() {
+  const found = [];
+  for (let page = 1; page <= 3; page += 1) {
+    try {
+      const { data } = await fetchJson(`${API_BASE}/domains?page=${page}`, {
+        headers: { 'Accept': 'application/ld+json, application/json' }
+      });
+      const batch = extractDomainItems(data)
+        .filter(isUsableMailTmDomain)
+        .map((item) => String(item.domain).trim().toLowerCase())
+        .filter(Boolean);
+      found.push(...batch);
+      if (!batch.length) break;
+    } catch (error) {
+      if (page === 1 && !FALLBACK_MAILTM_DOMAINS.length) throw error;
+      break;
+    }
+  }
+  return [...new Set([...found, ...FALLBACK_MAILTM_DOMAINS])];
+}
+
 async function createMailAccount() {
   if (isBusy('create-email')) return;
   setBusy('create-email', true);
   renderHome();
   try {
-    const { data: domainData } = await fetchJson(`${API_BASE}/domains?page=1`, { headers: { 'Accept': 'application/json' } });
-    const domains = domainData?.['hydra:member'] || [];
-    const domain = domains.find((item) => item.isActive !== false && item.isPrivate !== true)?.domain;
-    if (!domain) throw new Error('لم يتم العثور على نطاق Mail.tm فعال حالياً.');
+    const domains = await getMailTmDomains();
+    if (!domains.length) throw new Error('تعذر جلب نطاق متاح من Mail.tm حالياً. حاول بعد قليل.');
 
     let created = null;
     let password = '';
     let address = '';
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      password = randomPassword();
-      address = `${randomUsername()}@${domain}`;
-      if (state.emails.some((email) => email.address.toLowerCase() === address.toLowerCase())) continue;
-      try {
-        const result = await fetchJson(`${API_BASE}/accounts`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-          body: JSON.stringify({ address, password })
-        });
-        created = result.data;
-        break;
-      } catch (error) {
-        if (error.status === 422) continue;
-        throw error;
+    let lastError = null;
+
+    for (const domain of domains.slice(0, 8)) {
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        password = randomPassword();
+        address = `${randomUsername()}@${domain}`;
+        if (state.emails.some((email) => email.address.toLowerCase() === address.toLowerCase())) continue;
+        try {
+          const result = await fetchJson(`${API_BASE}/accounts`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Accept': 'application/ld+json, application/json' },
+            body: JSON.stringify({ address, password })
+          });
+          created = result.data;
+          break;
+        } catch (error) {
+          lastError = error;
+          if ([404, 422].includes(error.status)) continue;
+          throw error;
+        }
       }
+      if (created) break;
     }
-    if (!created) throw new Error('تعذر إنشاء اسم إيميل فريد بعد عدة محاولات. حاول مرة أخرى.');
+
+    if (!created) throw new Error(lastError?.message || 'تعذر إنشاء الإيميل على النطاقات المتاحة. حاول مرة أخرى بعد قليل.');
 
     const { data: tokenData } = await fetchJson(`${API_BASE}/token`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/ld+json, application/json' },
       body: JSON.stringify({ address, password })
     });
-    if (!tokenData?.token) throw new Error('تم إنشاء الحساب، لكن تعذر استخراج Token. حاول إضافته كحساب موجود.');
-    const email = buildEmailRecord({ mailTmId: created.id || tokenData.id, address, password, token: tokenData.token, createdAt: created.createdAt || new Date().toISOString() });
+    if (!tokenData?.token) throw new Error('تم إنشاء الحساب، لكن تعذر استخراج رمز الدخول. حاول مرة أخرى.');
+
+    const email = buildEmailRecord({
+      mailTmId: created.id || tokenData.id,
+      address,
+      password,
+      token: tokenData.token,
+      createdAt: created.createdAt || new Date().toISOString()
+    });
     state.emails.unshift(email);
     state.lastEmailId = email.localId;
     if (!saveState()) return;
@@ -1012,7 +1046,7 @@ async function createMailAccount() {
     ui.returnView = 'home';
     ui.view = 'email-detail';
   } catch (error) {
-    toast(error.message || 'حدث خطأ غير متوقع أثناء إنشاء الإيميل.', 'error', 6000);
+    toast(error.message || 'تعذر إنشاء الإيميل. تحقق من الإنترنت وحاول مرة أخرى.', 'error', 6500);
   } finally {
     setBusy('create-email', false);
     render();
@@ -1085,7 +1119,7 @@ async function saveLocalEmail() {
   state.lastEmailId = email.localId;
   if (!saveState()) return;
   closeModal();
-  toast('تمت إضافة الإيميل العادي بنجاح.');
+  toast('تمت إضافة الإيميل بنجاح.');
   ui.selectedEmailId = email.localId;
   ui.returnView = 'home';
   ui.view = 'email-detail';
@@ -1189,26 +1223,64 @@ async function openMessage(messageId, archiveId = '') {
 async function fetchLatestCode(emailId) {
   const email = getEmail(emailId);
   if (!email) return;
-  if (!isMailTmEmail(email)) { toast('جلب الكود متاح لحسابات Mail.tm فقط.', 'info'); return; }
+  if (!isMailTmEmail(email)) {
+    toast('جلب الكود يعمل فقط مع الإيميلات التي تم إنشاؤها تلقائياً من Mail.tm.', 'info', 5000);
+    return;
+  }
+
   openSheet(`
     <div class="sheet-title"><h2>جلب الكود</h2><button class="close-btn" data-action="close-sheet">×</button></div>
-    <div class="skeleton" style="height:96px"></div><p class="helper" style="text-align:center">جاري البحث عن الرسائل...</p>
+    <div class="skeleton" style="height:120px"></div>
+    <p class="helper" style="text-align:center">جاري التحقق من آخر الرسائل...</p>
   `);
   ui.inboxEmailId = emailId;
+
   try {
-    const messages = await fetchMessages(email);
-    if (!messages.length) {
+    const messages = await fetchMessages(email, { updateUi: false });
+    const newest = [...messages]
+      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+      .slice(0, 8);
+
+    if (!newest.length) {
       openSheet(`
         <div class="sheet-title"><h2>جلب الكود</h2><button class="close-btn" data-action="close-sheet">×</button></div>
-        ${emptyState('📭','لا توجد رسائل حالياً','لم تصل أي رسالة حتى الآن. يمكنك تشغيل الانتظار لمدة تصل إلى دقيقة.')}
-        <button class="btn warning wide" data-action="start-waiting" data-email-id="${email.localId}">انتظار وصول الكود</button>
+        ${emptyState('📭', 'لا توجد رسائل حالياً', 'لم يصل أي كود حتى الآن.')}
+        <button class="btn primary wide" data-action="fetch-code" data-email-id="${email.localId}">تحديث</button>
       `);
       return;
     }
-    const latest = [...messages].sort((a,b) => new Date(b.createdAt) - new Date(a.createdAt))[0];
-    await openMessage(latest.id);
+
+    let code = '';
+    let matchedMessage = null;
+    for (const message of newest) {
+      const { data: detail } = await apiForEmail(email, `/messages/${encodeURIComponent(message.id)}`);
+      code = extractFourDigitCode(detail);
+      if (code) {
+        matchedMessage = detail;
+        break;
+      }
+    }
+
+    if (!code) {
+      openSheet(`
+        <div class="sheet-title"><h2>جلب الكود</h2><button class="close-btn" data-action="close-sheet">×</button></div>
+        ${emptyState('🔎', 'لم يتم العثور على كود من 4 أرقام', 'تحقق الموقع من أحدث الرسائل، لكن لم يجد كوداً واضحاً.')}
+        <button class="btn primary wide" data-action="fetch-code" data-email-id="${email.localId}">تحديث</button>
+      `);
+      return;
+    }
+
+    openSheet(`
+      <div class="sheet-title"><h2>آخر كود وصل</h2><button class="close-btn" data-action="close-sheet">×</button></div>
+      <button class="one-tap-code" data-action="copy-text" data-copy="${escapeHTML(code)}">
+        <strong>${escapeHTML(code)}</strong>
+        <small>اضغط على الكود لنسخه</small>
+      </button>
+      <p class="helper code-source">${escapeHTML(matchedMessage?.subject || 'آخر رسالة وصلت')}</p>
+      <button class="btn ghost wide" data-action="fetch-code" data-email-id="${email.localId}">تحديث</button>
+    `);
   } catch (error) {
-    toast(error.message || 'تعذر جلب الرسائل.', 'error', 5200);
+    toast(error.message || 'تعذر جلب الكود. تحقق من الإنترنت وحاول مرة أخرى.', 'error', 6000);
     closeSheet();
   }
 }
@@ -1557,8 +1629,8 @@ function openExistingModal() {
 
 function openLocalEmailModal() {
   openModal(`
-    <h2>إضافة إيميل عادي</h2>
-    <p>سيُحفظ البريد محلياً مع خمسة بروفايلات، من دون محاولة تسجيل الدخول إلى Mail.tm.</p>
+    <h2>إضافة إيميل</h2>
+    <p>أدخل أي بريد إلكتروني لإضافته مع خمسة بروفايلات.</p>
     <div class="form-grid">
       <div class="field"><label>البريد الإلكتروني</label><input id="localEmailAddress" class="input" type="email" dir="ltr" autocomplete="off" placeholder="nhyffga@hi2.in"></div>
       <p id="localEmailError" class="form-error"></p>
