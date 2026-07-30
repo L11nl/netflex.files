@@ -462,10 +462,10 @@ function renderEmailDetail() {
     <section class="card account-summary simple-account-summary">
       <div class="simple-account-actions">
         <button class="btn soft" data-action="copy-text" data-copy="${escapeHTML(email.address)}">نسخ الإيميل</button>
-        <button class="btn primary" data-action="fetch-code" data-email-id="${email.localId}">جلب الكود</button>
+        <button class="btn primary" data-action="fetch-code" data-email-id="${email.localId}">جلب الكود والروابط</button>
         <button class="btn ghost" data-action="change-profile-icons" data-email-id="${email.localId}">تغيير الرموز</button>
       </div>
-      ${!mailTm ? '<p class="helper simple-note">هذا الإيميل مضاف للتنظيم فقط، لذلك جلب الكود يحتاج حساباً تم إنشاؤه تلقائياً من Mail.tm.</p>' : ''}
+      ${!mailTm ? '<p class="helper simple-note">هذا الإيميل مضاف للتنظيم فقط، لذلك جلب الكود والروابط يحتاج حساباً تم إنشاؤه تلقائياً من Mail.tm.</p>' : ''}
     </section>
 
     <section class="section">
@@ -620,7 +620,7 @@ function openProfileSheet(emailId, profileNumber) {
     <div class="profile-quick-actions">
       <button class="btn primary wide" data-action="copy-text" data-copy="${escapeHTML(profile.pin)}">نسخ الرمز</button>
       <button class="btn soft wide" data-action="copy-text" data-copy="${escapeHTML(email.address)}">نسخ الإيميل</button>
-      <button class="btn ghost wide" data-action="fetch-code" data-email-id="${email.localId}">جلب الكود</button>
+      <button class="btn ghost wide" data-action="fetch-code" data-email-id="${email.localId}">جلب الكود والروابط</button>
     </div>
     <div class="simple-status-block">
       <span>الحالة الحالية: <strong>${statusLabel(profile.status)}</strong></span>
@@ -842,6 +842,93 @@ function extractFourDigitCode(detail) {
   }
   candidates.sort((a, b) => b.score - a.score);
   return candidates.find((item) => item.score > 20)?.code || '';
+}
+
+
+function decodeHtmlEntities(value = '') {
+  const textarea = document.createElement('textarea');
+  textarea.innerHTML = String(value);
+  return textarea.value;
+}
+
+function normalizeExtractedUrl(value = '') {
+  let url = decodeHtmlEntities(value)
+    .trim()
+    .replace(/^[\s<({"']+/, '')
+    .replace(/[\s>)}"'.,;!?،؛]+$/, '');
+  if (/^www\./i.test(url)) url = `https://${url}`;
+  try {
+    const parsed = new URL(url);
+    if (!['http:', 'https:'].includes(parsed.protocol)) return '';
+    return parsed.href;
+  } catch (_) {
+    return '';
+  }
+}
+
+function extractMessageLinks(detail) {
+  const links = [];
+  const add = (value) => {
+    const normalized = normalizeExtractedUrl(value);
+    if (normalized && !links.includes(normalized)) links.push(normalized);
+  };
+
+  const htmlParts = Array.isArray(detail?.html) ? detail.html : [detail?.html || ''];
+  for (const html of htmlParts) {
+    if (!html) continue;
+    const doc = new DOMParser().parseFromString(String(html), 'text/html');
+    doc.querySelectorAll('a[href]').forEach((anchor) => add(anchor.getAttribute('href')));
+  }
+
+  const sources = [
+    detail?.subject,
+    detail?.text,
+    detail?.intro,
+    detail?.verifications,
+    ...htmlParts
+  ];
+  const urlRegex = /(?:https?:\/\/|www\.)[^\s<>"']+/gi;
+  for (const source of sources) {
+    if (source === null || source === undefined) continue;
+    const text = typeof source === 'string' ? source : JSON.stringify(source);
+    for (const match of text.matchAll(urlRegex)) add(match[0]);
+  }
+
+  return links.slice(0, 12);
+}
+
+function linkDisplayText(url) {
+  try {
+    const parsed = new URL(url);
+    const path = `${parsed.pathname || ''}${parsed.search || ''}`;
+    const compact = `${parsed.hostname}${path === '/' ? '' : path}`;
+    return compact.length > 70 ? `${compact.slice(0, 67)}…` : compact;
+  } catch (_) {
+    return url.length > 70 ? `${url.slice(0, 67)}…` : url;
+  }
+}
+
+function renderFetchedLinks(links = []) {
+  if (!links.length) return '';
+  return `
+    <div class="fetched-links-block">
+      <h3>الروابط الموجودة في الرسالة</h3>
+      <div class="fetched-links-list">
+        ${links.map((url, index) => `
+          <article class="fetched-link-card">
+            <div class="fetched-link-info">
+              <span>الرابط ${index + 1}</span>
+              <b dir="ltr">${escapeHTML(linkDisplayText(url))}</b>
+            </div>
+            <div class="fetched-link-actions">
+              <a class="btn primary" href="${escapeHTML(url)}" target="_blank" rel="noopener noreferrer">فتح الرابط</a>
+              <button class="btn soft" data-action="copy-text" data-copy="${escapeHTML(url)}">نسخ الرابط</button>
+            </div>
+          </article>
+        `).join('')}
+      </div>
+    </div>
+  `;
 }
 
 async function fetchJson(url, options = {}, timeoutMs = 22000) {
@@ -1224,12 +1311,12 @@ async function fetchLatestCode(emailId) {
   const email = getEmail(emailId);
   if (!email) return;
   if (!isMailTmEmail(email)) {
-    toast('جلب الكود يعمل فقط مع الإيميلات التي تم إنشاؤها تلقائياً من Mail.tm.', 'info', 5000);
+    toast('جلب الكود والروابط يعمل فقط مع الإيميلات التي تم إنشاؤها تلقائياً من Mail.tm.', 'info', 5000);
     return;
   }
 
   openSheet(`
-    <div class="sheet-title"><h2>جلب الكود</h2><button class="close-btn" data-action="close-sheet">×</button></div>
+    <div class="sheet-title"><h2>جلب الكود والروابط</h2><button class="close-btn" data-action="close-sheet">×</button></div>
     <div class="skeleton" style="height:120px"></div>
     <p class="helper" style="text-align:center">جاري التحقق من آخر الرسائل...</p>
   `);
@@ -1243,44 +1330,52 @@ async function fetchLatestCode(emailId) {
 
     if (!newest.length) {
       openSheet(`
-        <div class="sheet-title"><h2>جلب الكود</h2><button class="close-btn" data-action="close-sheet">×</button></div>
-        ${emptyState('📭', 'لا توجد رسائل حالياً', 'لم يصل أي كود حتى الآن.')}
+        <div class="sheet-title"><h2>جلب الكود والروابط</h2><button class="close-btn" data-action="close-sheet">×</button></div>
+        ${emptyState('📭', 'لا توجد رسائل حالياً', 'لم تصل أي رسالة حتى الآن.')}
         <button class="btn primary wide" data-action="fetch-code" data-email-id="${email.localId}">تحديث</button>
       `);
       return;
     }
 
     let code = '';
+    let links = [];
     let matchedMessage = null;
+
     for (const message of newest) {
       const { data: detail } = await apiForEmail(email, `/messages/${encodeURIComponent(message.id)}`);
-      code = extractFourDigitCode(detail);
-      if (code) {
+      const foundCode = extractFourDigitCode(detail);
+      const foundLinks = extractMessageLinks(detail);
+      if (foundCode || foundLinks.length) {
+        code = foundCode;
+        links = foundLinks;
         matchedMessage = detail;
         break;
       }
     }
 
-    if (!code) {
+    if (!code && !links.length) {
       openSheet(`
-        <div class="sheet-title"><h2>جلب الكود</h2><button class="close-btn" data-action="close-sheet">×</button></div>
-        ${emptyState('🔎', 'لم يتم العثور على كود من 4 أرقام', 'تحقق الموقع من أحدث الرسائل، لكن لم يجد كوداً واضحاً.')}
+        <div class="sheet-title"><h2>جلب الكود والروابط</h2><button class="close-btn" data-action="close-sheet">×</button></div>
+        ${emptyState('🔎', 'لم يتم العثور على كود أو رابط', 'تم فحص أحدث الرسائل، لكن لا يوجد كود من 4 أرقام أو رابط واضح.')}
         <button class="btn primary wide" data-action="fetch-code" data-email-id="${email.localId}">تحديث</button>
       `);
       return;
     }
 
     openSheet(`
-      <div class="sheet-title"><h2>آخر كود وصل</h2><button class="close-btn" data-action="close-sheet">×</button></div>
-      <button class="one-tap-code" data-action="copy-text" data-copy="${escapeHTML(code)}">
-        <strong>${escapeHTML(code)}</strong>
-        <small>اضغط على الكود لنسخه</small>
-      </button>
+      <div class="sheet-title"><h2>${code ? 'آخر كود وروابط وصلت' : 'آخر روابط وصلت'}</h2><button class="close-btn" data-action="close-sheet">×</button></div>
+      ${code ? `
+        <button class="one-tap-code" data-action="copy-text" data-copy="${escapeHTML(code)}">
+          <strong>${escapeHTML(code)}</strong>
+          <small>اضغط على الكود لنسخه</small>
+        </button>
+      ` : '<div class="notice no-code-notice">لم يوجد كود من 4 أرقام في هذه الرسالة، لكن تم العثور على روابط.</div>'}
+      ${renderFetchedLinks(links)}
       <p class="helper code-source">${escapeHTML(matchedMessage?.subject || 'آخر رسالة وصلت')}</p>
       <button class="btn ghost wide" data-action="fetch-code" data-email-id="${email.localId}">تحديث</button>
     `);
   } catch (error) {
-    toast(error.message || 'تعذر جلب الكود. تحقق من الإنترنت وحاول مرة أخرى.', 'error', 6000);
+    toast(error.message || 'تعذر جلب الكود أو الروابط. تحقق من الإنترنت وحاول مرة أخرى.', 'error', 6000);
     closeSheet();
   }
 }
