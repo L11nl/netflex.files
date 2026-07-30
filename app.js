@@ -2,8 +2,11 @@
 
 /* تطبيق ثابت بالكامل: جميع البيانات تحفظ داخل LocalStorage فقط. */
 const STORAGE_KEY = 'cd-mail-profile-manager-v1';
-const API_BASE = 'https://api.mail.tm';
-const FALLBACK_MAILTM_DOMAINS = ['deltajohnsons.com'];
+const MAIL_PROVIDERS = [
+  { id: 'mailtm', name: 'Mail.tm', apiBase: 'https://api.mail.tm' },
+  { id: 'mailgw', name: 'Mail.gw', apiBase: 'https://api.mail.gw' }
+];
+const LEGACY_UNRELIABLE_DOMAINS = new Set(['web-library.net', 'deltajohnsons.com']);
 const DEFAULT_PINS = ['1212', '1001', '2121', '2026', '2002'];
 const DEFAULT_COLORS = ['#0A84FF', '#FFD60A', '#FF3B30', '#00677A', '#30D18A'];
 const READY_ICONS = ['face', 'star', 'crown', 'heart', 'bolt'];
@@ -112,7 +115,8 @@ function normalizeState(raw) {
       address: email.address || '',
       password: email.password || '',
       token: email.token || '',
-      provider: email.provider === 'local' ? 'local' : 'mailtm',
+      provider: email.provider === 'local' ? 'local' : (email.provider === 'mailgw' ? 'mailgw' : 'mailtm'),
+      apiBase: email.apiBase || (email.provider === 'mailgw' ? 'https://api.mail.gw' : email.provider === 'local' ? '' : 'https://api.mail.tm'),
       localName: email.localName || '',
       createdAt: email.createdAt || new Date().toISOString(),
       status: ['active', 'archived', 'completed'].includes(email.status) ? email.status : 'active',
@@ -198,7 +202,21 @@ function isMailTmEmail(email) {
 }
 
 function emailProviderLabel(email) {
-  return isMailTmEmail(email) ? 'Mail.tm' : 'إيميل عادي';
+  if (!isMailTmEmail(email)) return 'إيميل عادي';
+  return email?.provider === 'mailgw' ? 'Mail.gw' : 'Mail.tm';
+}
+
+function getEmailApiBase(email) {
+  if (!email || email.provider === 'local') return '';
+  return email.apiBase || (email.provider === 'mailgw' ? 'https://api.mail.gw' : 'https://api.mail.tm');
+}
+
+function getProvider(providerId) {
+  return MAIL_PROVIDERS.find((provider) => provider.id === providerId) || MAIL_PROVIDERS[0];
+}
+
+function emailDomain(address = '') {
+  return String(address).split('@').pop().trim().toLowerCase();
 }
 
 function isValidEmailAddress(address) {
@@ -962,17 +980,18 @@ async function fetchJson(url, options = {}, timeoutMs = 22000) {
 function apiErrorMessage(status, data) {
   const server = data?.['hydra:description'] || data?.detail || data?.message || '';
   if (status === 401) return 'انتهت جلسة الإيميل أو كلمة المرور غير صحيحة.';
-  if (status === 404) return 'العنصر المطلوب غير موجود في Mail.tm.';
+  if (status === 404) return 'العنصر المطلوب غير موجود في خدمة البريد.';
   if (status === 422) return server || 'البيانات غير صالحة أو الإيميل مستخدم مسبقاً.';
   if (status === 429) return 'تم تجاوز عدد الطلبات. انتظر قليلاً ثم حاول مرة أخرى.';
-  if (status >= 500) return 'خدمة Mail.tm تواجه مشكلة مؤقتة. حاول لاحقاً.';
+  if (status >= 500) return 'خدمة البريد تواجه مشكلة مؤقتة. حاول لاحقاً.';
   return server || `حدث خطأ من API برمز ${status}.`;
 }
 
 async function refreshEmailToken(email, showSuccess = false) {
-  if (!isMailTmEmail(email)) throw new Error('هذا إيميل عادي ولا يرتبط بخدمة Mail.tm.');
+  if (!isMailTmEmail(email)) throw new Error('هذا إيميل عادي ولا يرتبط بخدمة البريد المؤقت.');
   if (!email?.address || !email?.password) throw new Error('لا توجد كلمة مرور محفوظة لهذا الإيميل.');
-  const { data } = await fetchJson(`${API_BASE}/token`, {
+  const apiBase = getEmailApiBase(email);
+  const { data } = await fetchJson(`${apiBase}/token`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
     body: JSON.stringify({ address: email.address, password: email.password })
@@ -986,12 +1005,13 @@ async function refreshEmailToken(email, showSuccess = false) {
 }
 
 async function apiForEmail(email, path, options = {}, retry401 = true) {
-  if (!isMailTmEmail(email)) throw new Error('هذا إيميل عادي ولا يمكن جلب رسائله عبر Mail.tm.');
+  if (!isMailTmEmail(email)) throw new Error('هذا إيميل عادي ولا يمكن جلب رسائله عبر API.');
   const headers = new Headers(options.headers || {});
   headers.set('Accept', 'application/json');
   if (email.token) headers.set('Authorization', `Bearer ${email.token}`);
   try {
-    return await fetchJson(`${API_BASE}${path}`, { ...options, headers });
+    const apiBase = getEmailApiBase(email);
+    return await fetchJson(`${apiBase}${path}`, { ...options, headers });
   } catch (error) {
     if (error.status === 401 && retry401) {
       try {
@@ -1013,14 +1033,13 @@ function randomPassword(length = 20) {
 }
 
 function randomUsername() {
-  const bytes = new Uint32Array(2);
+  const bytes = new Uint32Array(1);
   crypto.getRandomValues(bytes);
-  const random = String((bytes[0] % 900000) + 100000);
-  const time = String(Date.now()).slice(-7);
-  return `cd${random}${time}`;
+  const random = String(bytes[0] % 100000).padStart(5, '0');
+  return `cd${random}`;
 }
 
-function buildEmailRecord({ mailTmId, address, password, token, provider = 'mailtm', createdAt = new Date().toISOString() }) {
+function buildEmailRecord({ mailTmId, address, password, token, provider = 'mailtm', apiBase = '', createdAt = new Date().toISOString() }) {
   const profiles = [1,2,3,4,5].map(createDefaultProfile);
   if (state.globalProfileStyles) {
     profiles.forEach((profile) => {
@@ -1030,6 +1049,7 @@ function buildEmailRecord({ mailTmId, address, password, token, provider = 'mail
   }
   return {
     localId: makeId(), mailTmId: mailTmId || '', address, password: password || '', token: token || '', provider,
+    apiBase: apiBase || (provider === 'mailgw' ? 'https://api.mail.gw' : provider === 'local' ? '' : 'https://api.mail.tm'),
     localName: '', createdAt, status: 'active', archivedAt: null, completedAt: null,
     archivedMessageIds: [], profiles
   };
@@ -1052,12 +1072,14 @@ function isUsableMailTmDomain(item) {
   return active && !isPrivate;
 }
 
-async function getMailTmDomains() {
+async function getProviderDomains(provider) {
   const found = [];
+  let lastError = null;
   for (let page = 1; page <= 3; page += 1) {
     try {
-      const { data } = await fetchJson(`${API_BASE}/domains?page=${page}`, {
-        headers: { 'Accept': 'application/ld+json, application/json' }
+      const { data } = await fetchJson(`${provider.apiBase}/domains?page=${page}&_=${Date.now()}`, {
+        headers: { 'Accept': 'application/ld+json, application/json' },
+        cache: 'no-store'
       });
       const batch = extractDomainItems(data)
         .filter(isUsableMailTmDomain)
@@ -1066,11 +1088,13 @@ async function getMailTmDomains() {
       found.push(...batch);
       if (!batch.length) break;
     } catch (error) {
-      if (page === 1 && !FALLBACK_MAILTM_DOMAINS.length) throw error;
+      lastError = error;
       break;
     }
   }
-  return [...new Set([...found, ...FALLBACK_MAILTM_DOMAINS])];
+  const domains = [...new Set(found)];
+  if (!domains.length && lastError) throw lastError;
+  return domains;
 }
 
 async function createMailAccount() {
@@ -1078,39 +1102,52 @@ async function createMailAccount() {
   setBusy('create-email', true);
   renderHome();
   try {
-    const domains = await getMailTmDomains();
-    if (!domains.length) throw new Error('تعذر جلب نطاق متاح من Mail.tm حالياً. حاول بعد قليل.');
-
-    let created = null;
+    let createdAccount = null;
+    let selectedProvider = null;
     let password = '';
     let address = '';
     let lastError = null;
 
-    for (const domain of domains.slice(0, 8)) {
-      for (let attempt = 0; attempt < 4; attempt += 1) {
-        password = randomPassword();
-        address = `${randomUsername()}@${domain}`;
-        if (state.emails.some((email) => email.address.toLowerCase() === address.toLowerCase())) continue;
-        try {
-          const result = await fetchJson(`${API_BASE}/accounts`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Accept': 'application/ld+json, application/json' },
-            body: JSON.stringify({ address, password })
-          });
-          created = result.data;
-          break;
-        } catch (error) {
-          lastError = error;
-          if ([404, 422].includes(error.status)) continue;
-          throw error;
-        }
+    for (const provider of MAIL_PROVIDERS) {
+      let domains = [];
+      try {
+        domains = await getProviderDomains(provider);
+      } catch (error) {
+        lastError = error;
+        continue;
       }
-      if (created) break;
+      if (!domains.length) continue;
+
+      for (const domain of domains.slice(0, 8)) {
+        for (let attempt = 0; attempt < 6; attempt += 1) {
+          password = randomPassword();
+          address = `${randomUsername()}@${domain}`;
+          if (state.emails.some((email) => email.address.toLowerCase() === address.toLowerCase())) continue;
+          try {
+            const result = await fetchJson(`${provider.apiBase}/accounts`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'Accept': 'application/ld+json, application/json' },
+              body: JSON.stringify({ address, password })
+            });
+            createdAccount = result.data;
+            selectedProvider = provider;
+            break;
+          } catch (error) {
+            lastError = error;
+            if ([404, 422].includes(error.status)) continue;
+            break;
+          }
+        }
+        if (createdAccount) break;
+      }
+      if (createdAccount) break;
     }
 
-    if (!created) throw new Error(lastError?.message || 'تعذر إنشاء الإيميل على النطاقات المتاحة. حاول مرة أخرى بعد قليل.');
+    if (!createdAccount || !selectedProvider) {
+      throw new Error(lastError?.message || 'تعذر إنشاء إيميل من النطاقات الفعالة حالياً. حاول مرة أخرى بعد قليل.');
+    }
 
-    const { data: tokenData } = await fetchJson(`${API_BASE}/token`, {
+    const { data: tokenData } = await fetchJson(`${selectedProvider.apiBase}/token`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Accept': 'application/ld+json, application/json' },
       body: JSON.stringify({ address, password })
@@ -1118,16 +1155,18 @@ async function createMailAccount() {
     if (!tokenData?.token) throw new Error('تم إنشاء الحساب، لكن تعذر استخراج رمز الدخول. حاول مرة أخرى.');
 
     const email = buildEmailRecord({
-      mailTmId: created.id || tokenData.id,
+      mailTmId: createdAccount.id || tokenData.id,
       address,
       password,
       token: tokenData.token,
-      createdAt: created.createdAt || new Date().toISOString()
+      provider: selectedProvider.id,
+      apiBase: selectedProvider.apiBase,
+      createdAt: createdAccount.createdAt || new Date().toISOString()
     });
     state.emails.unshift(email);
     state.lastEmailId = email.localId;
     if (!saveState()) return;
-    toast('تم إنشاء الإيميل بنجاح.');
+    toast(`تم إنشاء الإيميل بنجاح عبر ${selectedProvider.name}.`);
     await copyText(address, false);
     ui.selectedEmailId = email.localId;
     ui.returnView = 'home';
@@ -1155,7 +1194,8 @@ async function saveExistingAccount() {
   const button = document.querySelector('[data-action="save-existing-account"]');
   if (button) { button.disabled = true; button.innerHTML = '<span class="spinner"></span> جاري التحقق...'; }
   try {
-    const { data: tokenData } = await fetchJson(`${API_BASE}/token`, {
+    const provider = getProvider('mailtm');
+    const { data: tokenData } = await fetchJson(`${provider.apiBase}/token`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
       body: JSON.stringify({ address, password })
@@ -1163,10 +1203,10 @@ async function saveExistingAccount() {
     if (!tokenData?.token) throw new Error('لم يتم استخراج Token من الحساب.');
     let account = {};
     try {
-      const result = await fetchJson(`${API_BASE}/me`, { headers: { 'Authorization': `Bearer ${tokenData.token}`, 'Accept': 'application/json' } });
+      const result = await fetchJson(`${provider.apiBase}/me`, { headers: { 'Authorization': `Bearer ${tokenData.token}`, 'Accept': 'application/json' }, cache: 'no-store' });
       account = result.data || {};
     } catch (_) { account = {}; }
-    const email = buildEmailRecord({ mailTmId: account.id || tokenData.id, address, password, token: tokenData.token, createdAt: account.createdAt || new Date().toISOString() });
+    const email = buildEmailRecord({ mailTmId: account.id || tokenData.id, address, password, token: tokenData.token, provider: provider.id, apiBase: provider.apiBase, createdAt: account.createdAt || new Date().toISOString() });
     state.emails.unshift(email);
     state.lastEmailId = email.localId;
     saveState();
@@ -1226,19 +1266,57 @@ async function copyText(text, notify = true) {
   if (notify) toast(text.match(/^\d{4,8}$/) ? 'تم نسخ الكود.' : 'تم النسخ بنجاح.');
 }
 
-async function fetchMessages(email, { updateUi = true } = {}) {
-  const first = await apiForEmail(email, '/messages?page=1');
-  let messages = first.data?.['hydra:member'] || [];
-  const total = Number(first.data?.['hydra:totalItems'] || messages.length);
-  const pageSize = Math.max(1, messages.length || 30);
-  const pages = Math.min(20, Math.ceil(total / pageSize));
-  for (let page = 2; page <= pages; page += 1) {
-    const next = await apiForEmail(email, `/messages?page=${page}`);
-    const batch = next.data?.['hydra:member'] || [];
-    if (!batch.length) break;
-    messages = messages.concat(batch);
+function extractMessageItems(data) {
+  if (Array.isArray(data)) return data;
+  if (!data || typeof data !== 'object') return [];
+  if (Array.isArray(data['hydra:member'])) return data['hydra:member'];
+  if (Array.isArray(data.member)) return data.member;
+  if (Array.isArray(data.messages)) return data.messages;
+  if (Array.isArray(data.data)) return data.data;
+  return [];
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function withCacheBuster(path) {
+  return `${path}${path.includes('?') ? '&' : '?'}_=${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+async function verifyEmailSession(email) {
+  const { data } = await apiForEmail(email, withCacheBuster('/me'), { cache: 'no-store' });
+  if (data?.address && String(data.address).toLowerCase() !== String(email.address).toLowerCase()) {
+    throw new Error('رمز الدخول مرتبط بإيميل مختلف. حدّث Token ثم حاول مرة أخرى.');
   }
-  const unique = [...new Map(messages.map((message) => [message.id, message])).values()];
+  return data;
+}
+
+async function fetchMessages(email, { updateUi = true, retryEmpty = false } = {}) {
+  const attempts = retryEmpty ? 4 : 1;
+  let unique = [];
+
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    if (attempt === 0) await verifyEmailSession(email);
+
+    const first = await apiForEmail(email, withCacheBuster('/messages?page=1'), { cache: 'no-store' });
+    let messages = extractMessageItems(first.data);
+    const total = Number(first.data?.['hydra:totalItems'] ?? first.data?.totalItems ?? messages.length);
+    const pageSize = Math.max(1, messages.length || 30);
+    const pages = Math.min(20, Math.ceil(total / pageSize));
+
+    for (let page = 2; page <= pages; page += 1) {
+      const next = await apiForEmail(email, withCacheBuster(`/messages?page=${page}`), { cache: 'no-store' });
+      const batch = extractMessageItems(next.data);
+      if (!batch.length) break;
+      messages = messages.concat(batch);
+    }
+
+    unique = [...new Map(messages.filter((message) => message?.id).map((message) => [message.id, message])).values()];
+    if (unique.length || !retryEmpty || attempt === attempts - 1) break;
+    await delay(1800);
+  }
+
   if (updateUi) ui.inboxMessages = unique;
   return unique;
 }
@@ -1246,7 +1324,7 @@ async function fetchMessages(email, { updateUi = true } = {}) {
 async function openInbox(emailId) {
   const email = getEmail(emailId);
   if (!email) return;
-  if (!isMailTmEmail(email)) { toast('صندوق الوارد متاح لحسابات Mail.tm فقط.', 'info'); return; }
+  if (!isMailTmEmail(email)) { toast('صندوق الوارد متاح للإيميلات المنشأة تلقائياً فقط.', 'info'); return; }
   ui.inboxEmailId = emailId;
   ui.inboxFilter = 'all';
   ui.inboxSearch = '';
@@ -1269,7 +1347,7 @@ async function refreshInbox() {
   ui.inboxLoading = true;
   renderInboxSheet();
   try {
-    await fetchMessages(email);
+    await fetchMessages(email, { updateUi: true, retryEmpty: true });
     toast(ui.inboxMessages.length ? 'تم تحديث صندوق الوارد.' : 'لم تصل أي رسالة حتى الآن.', ui.inboxMessages.length ? 'success' : 'info');
   } catch (error) {
     toast(error.message || 'تعذر جلب الرسائل.', 'error', 5200);
@@ -1311,7 +1389,7 @@ async function fetchLatestCode(emailId) {
   const email = getEmail(emailId);
   if (!email) return;
   if (!isMailTmEmail(email)) {
-    toast('جلب الكود والروابط يعمل فقط مع الإيميلات التي تم إنشاؤها تلقائياً من Mail.tm.', 'info', 5000);
+    toast('جلب الكود والروابط يعمل فقط مع الإيميلات التي تم إنشاؤها تلقائياً.', 'info', 5000);
     return;
   }
 
@@ -1323,15 +1401,18 @@ async function fetchLatestCode(emailId) {
   ui.inboxEmailId = emailId;
 
   try {
-    const messages = await fetchMessages(email, { updateUi: false });
+    const messages = await fetchMessages(email, { updateUi: false, retryEmpty: true });
     const newest = [...messages]
       .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
       .slice(0, 8);
 
     if (!newest.length) {
+      const legacyDomain = LEGACY_UNRELIABLE_DOMAINS.has(emailDomain(email.address));
       openSheet(`
         <div class="sheet-title"><h2>جلب الكود والروابط</h2><button class="close-btn" data-action="close-sheet">×</button></div>
-        ${emptyState('📭', 'لا توجد رسائل حالياً', 'لم تصل أي رسالة حتى الآن.')}
+        ${emptyState('📭', 'لا توجد رسائل حالياً', legacyDomain
+          ? 'هذا الإيميل أُنشئ على نطاق احتياطي قديم وقد لا يستقبل الرسائل. أنشئ إيميلاً جديداً بعد تحديث الملف.'
+          : 'تم فحص البريد عدة مرات ولم تصل رسالة حتى الآن. انتظر قليلاً ثم اضغط تحديث.')}
         <button class="btn primary wide" data-action="fetch-code" data-email-id="${email.localId}">تحديث</button>
       `);
       return;
