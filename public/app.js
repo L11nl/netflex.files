@@ -1,4 +1,4 @@
-const APP_BUILD = "2026-08-08-railway-backend-v1";
+const APP_BUILD = "2026-08-08-auto-inbox-v2";
 'use strict';
 
 /* تطبيق ثابت بالكامل: جميع البيانات تحفظ داخل LocalStorage فقط. */
@@ -140,6 +140,8 @@ function normalizeState(raw) {
       generatorDomain: email.generatorDomain || (provider === 'generator' ? (domain || GENERATOR_DOMAIN) : ''),
       generatorSeenIds: Array.isArray(email.generatorSeenIds) ? email.generatorSeenIds : [],
       generatorDeletedIds: Array.isArray(email.generatorDeletedIds) ? email.generatorDeletedIds : [],
+      generatorAutoKnownIds: Array.isArray(email.generatorAutoKnownIds) ? email.generatorAutoKnownIds : [],
+      generatorAutoInitialized: Boolean(email.generatorAutoInitialized),
       localName: email.localName || '',
       createdAt: email.createdAt || new Date().toISOString(),
       status: ['active', 'archived', 'completed'].includes(email.status) ? email.status : 'active',
@@ -766,7 +768,7 @@ function renderInboxSheet() {
       <button class="btn ghost wide" style="margin-bottom:10px" data-action="set-inbox-filter" data-filter="archived">الرسائل المؤرشفة محلياً</button>
       <div class="searchbar"><span>⌕</span><input class="input" data-inbox-search value="${escapeHTML(ui.inboxSearch)}" placeholder="البحث باسم المرسل أو عنوان الرسالة"></div>
       <div class="message-list">
-        ${ui.inboxLoading ? '<div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>' : list.length ? list.map(messageCard).join('') : emptyState('📭', ui.inboxFilter==='archived'?'لا توجد رسائل مؤرشفة':'لا توجد رسائل حالياً', ui.inboxFilter==='archived'?'الرسائل المؤرشفة محلياً ستظهر هنا.':'اضغط تحديث أو شغّل انتظار وصول الكود.')}
+        ${ui.inboxLoading ? '<div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>' : list.length ? list.map(messageCard).join('') : emptyState('📭', ui.inboxFilter==='archived'?'لا توجد رسائل مؤرشفة':'لا توجد رسائل حالياً', ui.inboxFilter==='archived'?'الرسائل المؤرشفة محلياً ستظهر هنا.':'يتم فحص هذا الصندوق تلقائياً، وستظهر الرسالة هنا فور اكتشافها.')}
       </div>
       <p class="helper" style="text-align:center;margin-top:12px">اسحب النافذة إلى الأسفل من أعلى القائمة لتحديث الرسائل.</p>
     </div>
@@ -1098,7 +1100,7 @@ function buildEmailRecord({ mailTmId, address, password, token, provider = 'gene
     localId: makeId(), mailTmId: mailTmId || '', address, password: password || '', token: token || '', provider,
     apiBase: apiBase || (provider === 'mailgw' ? 'https://api.mail.gw' : provider === 'mailtm' ? 'https://api.mail.tm' : ''),
     generatorDomain: provider === 'generator' ? (emailDomain(address) || GENERATOR_DOMAIN) : '',
-    generatorSeenIds: [], generatorDeletedIds: [],
+    generatorSeenIds: [], generatorDeletedIds: [], generatorAutoKnownIds: [], generatorAutoInitialized: false,
     localName: '', createdAt, status: 'active', archivedAt: null, completedAt: null,
     archivedMessageIds: [], profiles
   };
@@ -1842,6 +1844,73 @@ function stopPolling(showToast = true) {
   polling = null;
   if (showToast) toast('تم إيقاف انتظار الرسائل.', 'info');
   if (ui.inboxEmailId && !els.sheet.classList.contains('hidden') && els.sheetContent.querySelector('[data-inbox-root]')) renderInboxSheet();
+}
+
+// =========================
+// مراقبة تلقائية لصناديق Generator.email داخل الموقع
+// لا تحتاج الضغط على «رسائل» أو «تحديث». عندما تكون الصفحة مفتوحة
+// يفحص الموقع جميع الإيميلات النشطة ويُحدّث الصندوق فور وصول رسالة جديدة.
+// =========================
+const WEBSITE_AUTO_CHECK_MS = 8000;
+let websiteAutoMonitorTimer = null;
+let websiteAutoMonitorBusy = false;
+
+async function autoCheckWebsiteMailboxes() {
+  if (websiteAutoMonitorBusy) return;
+  websiteAutoMonitorBusy = true;
+  let changed = false;
+
+  try {
+    const emails = state.emails.filter((email) => email.status === 'active' && isGeneratorEmail(email));
+
+    for (const email of emails) {
+      try {
+        const messages = await fetchGeneratorMessages(email, { retryEmpty: false });
+        const known = new Set(Array.isArray(email.generatorAutoKnownIds) ? email.generatorAutoKnownIds : []);
+        const ids = messages.map((message) => message.id).filter(Boolean);
+
+        // أول فحص فقط: اعتبر الرسائل الموجودة baseline حتى لا يرسل تنبيهات قديمة.
+        // نستخدم علماً مستقلاً لأن الصندوق قد يكون فارغاً، وSet فارغ وحده لا يكفي لمعرفة أن baseline تم.
+        if (!email.generatorAutoInitialized) {
+          email.generatorAutoKnownIds = ids.slice(-200);
+          email.generatorAutoInitialized = true;
+          changed = true;
+        } else {
+          const fresh = messages.filter((message) => message.id && !known.has(message.id));
+          for (const id of ids) known.add(id);
+          email.generatorAutoKnownIds = Array.from(known).slice(-200);
+          changed = true;
+
+          if (fresh.length) {
+            const newest = fresh[0];
+            notifyArrival();
+            toast(`📬 وصلت رسالة جديدة إلى ${email.address}${newest?.subject ? ` · ${newest.subject}` : ''}`, 'success', 6500);
+          }
+        }
+
+        // إذا صندوق هذا الإيميل مفتوح، حدّث القائمة مباشرة بدون أي زر.
+        if (ui.inboxEmailId === email.localId) {
+          ui.inboxMessages = messages;
+          if (!els.sheet.classList.contains('hidden') && els.sheetContent.querySelector('[data-inbox-root]')) {
+            renderInboxSheet();
+          }
+        }
+      } catch (error) {
+        // لا نزعج المستخدم كل 8 ثوانٍ إذا تعطلت الخدمة لحظياً؛ زر التحديث سيعرض الخطأ التفصيلي عند الحاجة.
+        console.warn('[auto-inbox]', email.address, error?.message || error);
+      }
+    }
+  } finally {
+    if (changed) saveState({ silent: true });
+    websiteAutoMonitorBusy = false;
+  }
+}
+
+function startWebsiteAutoMonitor() {
+  if (websiteAutoMonitorTimer) clearInterval(websiteAutoMonitorTimer);
+  // فحص أول بعد فتح التطبيق ثم فحص مستمر قريب من الوقت الحقيقي.
+  setTimeout(() => autoCheckWebsiteMailboxes().catch(() => {}), 1200);
+  websiteAutoMonitorTimer = setInterval(() => autoCheckWebsiteMailboxes().catch(() => {}), WEBSITE_AUTO_CHECK_MS);
 }
 
 function notifyArrival() {
@@ -2629,6 +2698,7 @@ async function init() {
   }else{
     els.app.classList.remove('hidden');render();
   }
+  startWebsiteAutoMonitor();
 }
 
 init();
