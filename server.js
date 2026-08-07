@@ -157,49 +157,60 @@ function parseMailbox(html, email) {
 }
 
 async function fetchMailboxHtml(email) {
-  const [username, domain] = email.split('@');
+  const address = normalizeAddress(email);
+  const [username, domain] = address.split('@');
+
+  // مهم: هذا هو نفس الرابط وطريقة الطلب في كود Python الذي يعمل مع Generator.email:
+  // https://generator.email/5xu.vn/username
+  // لا نضيف query string ولا نطلب API وهمي ولا نشترط ظهور الإيميل كنص داخل الصفحة.
   const targets = [
     `${GENERATOR_BASE}/${domain}/${username}`,
-    `${GENERATOR_BASE}/inbox9/${email}`,
-    `${GENERATOR_BASE}/${email}`
+    `${GENERATOR_BASE}/inbox9/${address}`
   ];
 
   const headers = {
+    // نفس الـ User-Agent الموجود في كود Python فقط.
     'User-Agent': 'Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 Chrome/136.0 Mobile Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.9,ar;q=0.8',
-    'Cache-Control': 'no-cache',
-    'Pragma': 'no-cache'
+    'Accept': '*/*'
   };
 
   let lastError = null;
+  let lastHtml = '';
+
   for (const target of targets) {
     try {
       const response = await axios.get(target, {
         headers,
-        timeout: 22000,
+        timeout: 20000,
         responseType: 'text',
-        maxRedirects: 5,
-        validateStatus: (status) => status >= 200 && status < 400,
-        params: { _: `${Date.now()}-${Math.random().toString(16).slice(2)}` }
+        maxRedirects: 8,
+        validateStatus: (status) => status >= 200 && status < 400
       });
 
       const html = String(response.data || '');
-      const lower = html.toLowerCase();
-      const identityOk = lower.includes(email) || (lower.includes(username) && lower.includes(domain));
-      if (!identityOk) {
-        lastError = new Error('الخدمة ردت بصفحة لا تخص صندوق هذا الإيميل.');
-        continue;
+      lastHtml = html;
+
+      // نفس BeautifulSoup: soup.find("div", id="email-table")
+      const $ = cheerio.load(html);
+      if ($('#email-table').length) {
+        return { html, source: target, finalUrl: response.request?.res?.responseUrl || target };
       }
-      return { html, source: target };
+
+      lastError = new Error(`Generator.email لم يعرض جدول الرسائل في ${target}`);
     } catch (error) {
       lastError = error;
     }
   }
 
+  // إذا رجعت صفحة HTML بلا جدول، لا نصفها كصندوق مختلف؛ نعطي خطأ واضح ليسهل التشخيص.
+  if (lastHtml) {
+    const error = new Error('Generator.email رد بصفحة، لكن جدول الرسائل email-table غير موجود فيها حالياً.');
+    error.statusCode = 502;
+    throw error;
+  }
+
   throw lastError || new Error('تعذر قراءة صندوق البريد من Generator.email.');
 }
-
 async function getMailbox(email) {
   const address = normalizeAddress(email);
   if (!isAllowedEmail(address)) {
@@ -220,7 +231,7 @@ async function getMailbox(email) {
 // =========================
 
 const EMAIL_LIFETIME_MS = 6 * 24 * 60 * 60 * 1000;
-const AUTO_CHECK_INTERVAL_MS = Math.max(15000, Number(process.env.AUTO_CHECK_INTERVAL_MS || 30000));
+const AUTO_CHECK_INTERVAL_MS = Math.max(5000, Number(process.env.AUTO_CHECK_INTERVAL_MS || 8000));
 const DEFAULT_PINS = ['1212', '1001', '2121', '2026', '2002'];
 
 function randomGeneratorUsername() {
