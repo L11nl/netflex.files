@@ -1647,13 +1647,13 @@ async function openMessage(messageId, archiveId = '') {
   }
 }
 
-async function fetchLatestCode(emailId) {
+async function fetchLatestCode(emailId, { openExternal = true } = {}) {
   const email = getEmail(emailId);
   if (!email) return;
   const generatorUrl = isGeneratorEmail(email) ? generatorInboxUrl(email) : '';
-  // حسب الطلب: عند الضغط نفتح رابط الصندوق الأصلي نفسه في تبويب جديد،
-  // وفي نفس الوقت يواصل الموقع قراءة نفس الرابط واستخراج الكود والروابط منه.
-  if (generatorUrl) {
+  // الضغط الأول على «جلب الكود والروابط» يفتح الصندوق الأصلي مرة واحدة.
+  // أما أزرار «تحديث» داخل النافذة فتجلب الرسائل فقط بدون فتح أو تحويل المستخدم إلى Generator.email.
+  if (generatorUrl && openExternal) {
     try { window.open(generatorUrl, '_blank', 'noopener,noreferrer'); } catch (_) {}
   }
   if (!hasRemoteInbox(email)) {
@@ -1663,7 +1663,7 @@ async function fetchLatestCode(emailId) {
   openSheet(`
     <div class="sheet-title"><h2>جلب الكود والروابط</h2><button class="close-btn" data-action="close-sheet">×</button></div>
     <div class="skeleton" style="height:120px"></div>
-    <p class="helper" style="text-align:center">جاري فتح صندوق البريد وفحص آخر الرسائل...</p>
+    <p class="helper" style="text-align:center">جاري فحص صندوق البريد وجلب آخر الرسائل...</p>
     ${generatorUrl ? `<a class="btn ghost wide" href="${escapeHTML(generatorUrl)}" target="_blank" rel="noopener noreferrer">فتح صندوق Generator.email</a>` : ''}
   `);
   ui.inboxEmailId = emailId;
@@ -1679,7 +1679,7 @@ async function fetchLatestCode(emailId) {
         <div class="sheet-title"><h2>جلب الكود والروابط</h2><button class="close-btn" data-action="close-sheet">×</button></div>
         ${emptyState('📭', 'لا توجد رسائل حالياً', 'تم فحص رابط صندوق البريد نفسه ولم تظهر رسالة حتى الآن.')}
         ${generatorUrl ? `<a class="btn ghost wide" href="${escapeHTML(generatorUrl)}" target="_blank" rel="noopener noreferrer">فتح الصندوق الأصلي</a>` : ''}
-        <button class="btn primary wide" data-action="fetch-code" data-email-id="${email.localId}">تحديث</button>
+        <button class="btn primary wide" data-action="fetch-code" data-refresh-only="1" data-email-id="${email.localId}">تحديث</button>
       `);
       return;
     }
@@ -1704,7 +1704,7 @@ async function fetchLatestCode(emailId) {
       openSheet(`
         <div class="sheet-title"><h2>جلب الكود والروابط</h2><button class="close-btn" data-action="close-sheet">×</button></div>
         ${emptyState('🔎', 'لم يتم العثور على كود أو رابط', 'تم فحص أحدث الرسائل، لكن لا يوجد كود من 4 أرقام أو رابط واضح.')}
-        <button class="btn primary wide" data-action="fetch-code" data-email-id="${email.localId}">تحديث</button>
+        <button class="btn primary wide" data-action="fetch-code" data-refresh-only="1" data-email-id="${email.localId}">تحديث</button>
       `);
       return;
     }
@@ -1720,7 +1720,7 @@ async function fetchLatestCode(emailId) {
       ${renderFetchedLinks(links)}
       <p class="helper code-source">${escapeHTML(matchedMessage?.subject || 'آخر رسالة وصلت')}</p>
       ${generatorUrl ? `<a class="btn ghost wide" href="${escapeHTML(generatorUrl)}" target="_blank" rel="noopener noreferrer">فتح الصندوق الأصلي</a>` : ''}
-      <button class="btn ghost wide" data-action="fetch-code" data-email-id="${email.localId}">تحديث</button>
+      <button class="btn ghost wide" data-action="fetch-code" data-refresh-only="1" data-email-id="${email.localId}">تحديث</button>
     `);
   } catch (error) {
     toast(error.message || 'تعذر جلب الكود أو الروابط. تحقق من الإنترنت وحاول مرة أخرى.', 'error', 6000);
@@ -2404,7 +2404,7 @@ async function handleClick(event) {
       case 'cancel-review': cancelProfileReview(target.dataset.emailId,target.dataset.profileNumber); break;
       case 'mark-sold': await markProfileSold(target.dataset.emailId,target.dataset.profileNumber); break;
       case 'restore-profile': await restoreProfile(target.dataset.emailId,target.dataset.profileNumber); break;
-      case 'fetch-code': await fetchLatestCode(target.dataset.emailId); break;
+      case 'fetch-code': await fetchLatestCode(target.dataset.emailId, { openExternal: target.dataset.refreshOnly !== '1' }); break;
       case 'open-inbox': await openInbox(target.dataset.emailId); break;
       case 'refresh-messages': await refreshInbox(); break;
       case 'set-inbox-filter': ui.inboxFilter=target.dataset.filter; renderInboxSheet(); break;
