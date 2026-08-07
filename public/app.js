@@ -432,6 +432,36 @@ function renderStats() {
 }
 
 
+function uniqueMessageLinks(links = []) {
+  const out = [];
+  const seen = new Set();
+  for (const value of Array.isArray(links) ? links : []) {
+    const normalized = normalizeExtractedUrl(value);
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    out.push(normalized);
+  }
+  return out;
+}
+
+function dedupeUrlsForDisplay(text = '') {
+  const seen = new Set();
+  const lines = String(text || '').split(/\r?\n/);
+  const out = [];
+  for (let line of lines) {
+    const matches = line.match(/https?:\/\/[^\s<>"']+/gi) || [];
+    for (const raw of matches) {
+      const cleaned = raw.replace(/[),.;"'<>]+$/g, '');
+      const normalized = normalizeExtractedUrl(cleaned);
+      if (!normalized) continue;
+      if (seen.has(normalized)) line = line.replace(raw, '').replace(/\s{2,}/g, ' ').trim();
+      else seen.add(normalized);
+    }
+    if (line.trim()) out.push(line.trim());
+  }
+  return out.join('\n');
+}
+
 function liveMessagesForEmail(emailId) {
   return Array.isArray(ui.liveInboxByEmail?.[emailId]) ? ui.liveInboxByEmail[emailId] : [];
 }
@@ -440,9 +470,9 @@ function renderLiveMessagePreview(email, message) {
   const senderName = message?.from?.name || '';
   const senderAddress = message?.from?.address || '';
   const sender = senderAddress || senderName || 'مرسل غير معروف';
-  const body = String(message?.text || message?.intro || '').trim();
+  const body = dedupeUrlsForDisplay(String(message?.text || message?.intro || '').trim());
   const codes = Array.isArray(message?.codes) ? message.codes : [];
-  const links = Array.isArray(message?.links) ? message.links : [];
+  const links = uniqueMessageLinks(message?.links);
   return `
     <article class="card list-card">
       <div class="email-top">
@@ -839,7 +869,7 @@ function messageCard(message) {
 
 function renderMessageDetailSheet(detail, email, archiveRecord = null) {
   const code = extractVerificationCode(detail);
-  const text = detail.text || detail.intro || '';
+  const text = dedupeUrlsForDisplay(detail.text || detail.intro || '');
   const safeHtml = detail.html ? sanitizeHtml(Array.isArray(detail.html) ? detail.html.join('\n') : detail.html) : '';
   const fromName = detail.from?.name || archiveRecord?.fromName || '';
   const fromAddress = detail.from?.address || archiveRecord?.fromAddress || '';
