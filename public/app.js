@@ -1,4 +1,4 @@
-const APP_BUILD = "2026-08-08-auto-inbox-v2";
+const APP_BUILD = "2026-08-08-auto-inbox-v3";
 'use strict';
 
 /* تطبيق ثابت بالكامل: جميع البيانات تحفظ داخل LocalStorage فقط. */
@@ -57,7 +57,8 @@ let ui = {
   inboxLoading: false,
   messageDetail: null,
   profileEditor: null,
-  autoSaveTimer: null
+  autoSaveTimer: null,
+  liveInboxByEmail: {}
 };
 let modalResolver = null;
 let polling = null;
@@ -430,6 +431,58 @@ function renderStats() {
   `;
 }
 
+
+function liveMessagesForEmail(emailId) {
+  return Array.isArray(ui.liveInboxByEmail?.[emailId]) ? ui.liveInboxByEmail[emailId] : [];
+}
+
+function renderLiveMessagePreview(email, message) {
+  const senderName = message?.from?.name || '';
+  const senderAddress = message?.from?.address || '';
+  const sender = senderAddress || senderName || 'مرسل غير معروف';
+  const body = String(message?.text || message?.intro || '').trim();
+  const codes = Array.isArray(message?.codes) ? message.codes : [];
+  const links = Array.isArray(message?.links) ? message.links : [];
+  return `
+    <article class="card list-card">
+      <div class="email-top">
+        <div>
+          <h3>${escapeHTML(message?.subject || 'بدون عنوان')}</h3>
+          <p dir="ltr">${escapeHTML(email?.address || '')}</p>
+        </div>
+        <span class="tag">وصلت تلقائياً</span>
+      </div>
+      <p><strong>من:</strong> ${escapeHTML(sender)}</p>
+      ${message?.createdAt ? `<p><strong>الوقت:</strong> ${escapeHTML(formatDate(message.createdAt))}</p>` : ''}
+      ${body ? `<div class="message-text" style="margin-top:9px">${escapeHTML(body.slice(0, 1200))}</div>` : ''}
+      ${codes.length ? `<div class="btn-row" style="margin-top:10px">${codes.slice(0,5).map((code)=>`<button class="btn primary small" data-action="copy-text" data-copy="${escapeHTML(code)}">نسخ ${escapeHTML(code)}</button>`).join('')}</div>` : ''}
+      ${links.length ? `<div class="btn-row" style="margin-top:8px">${links.slice(0,4).map((url, index)=>`<a class="btn soft small" href="${escapeHTML(url)}" target="_blank" rel="noopener noreferrer">فتح الرابط ${index+1}</a>`).join('')}</div>` : ''}
+    </article>
+  `;
+}
+
+function renderAutomaticMessagesSection(activeEmails) {
+  const collected = [];
+  for (const email of activeEmails) {
+    for (const message of liveMessagesForEmail(email.localId).slice(0, 3)) {
+      collected.push({ email, message });
+    }
+  }
+  collected.sort((x, y) => new Date(y.message?.createdAt || 0) - new Date(x.message?.createdAt || 0));
+  return `
+    <section class="section" id="automatic-messages">
+      <div class="section-head">
+        <div><h2>الرسائل الواردة تلقائياً</h2><p>أي رسالة جديدة تظهر هنا بدون زر تحديث</p></div>
+      </div>
+      <div class="message-list">
+        ${collected.length
+          ? collected.slice(0, 10).map(({email,message}) => renderLiveMessagePreview(email, message)).join('')
+          : emptyState('🔔', 'بانتظار الرسائل', 'أي رسالة جديدة ستظهر هنا تلقائياً عند وصولها.')}
+      </div>
+    </section>
+  `;
+}
+
 function renderHome() {
   const activeEmails = state.emails.filter((email) => email.status === 'active');
   els.main.innerHTML = `
@@ -453,6 +506,7 @@ function renderHome() {
         ${activeEmails.length ? activeEmails.map((email) => emailCard(email, false)).join('') : emptyState('📨', 'لا توجد إيميلات بعد', 'أنشئ إيميلاً تلقائياً أو أضف إيميلاً للبدء.')}
       </div>
     </section>
+    ${renderAutomaticMessagesSection(activeEmails)}
   `;
 }
 
@@ -515,10 +569,9 @@ function renderEmailDetail() {
     <section class="card account-summary simple-account-summary">
       <div class="simple-account-actions">
         <button class="btn soft" data-action="copy-text" data-copy="${escapeHTML(email.address)}">نسخ الإيميل</button>
-        <button type="button" class="btn primary" data-action="fetch-code" data-email-id="${email.localId}">جلب الكود والروابط</button>
         <button class="btn ghost" data-action="change-profile-icons" data-email-id="${email.localId}">تغيير الرموز</button>
       </div>
-      ${!remoteInbox ? '<p class="helper simple-note">هذا الإيميل مضاف للتنظيم فقط. جلب الرسائل يعمل مع الإيميلات المنشأة تلقائياً من Generator.email.</p>' : ''}
+      ${remoteInbox ? '<p class="helper simple-note">🔔 الرسائل تصل تلقائياً وتظهر في الصفحة الرئيسية، ولا تحتاج زر جلب أو تحديث.</p>' : '<p class="helper simple-note">هذا الإيميل مضاف للتنظيم فقط ولا يمكن مراقبة رسائله عبر Generator.email.</p>'}
     </section>
 
     <section class="section">
@@ -673,7 +726,6 @@ function openProfileSheet(emailId, profileNumber) {
     <div class="profile-quick-actions">
       <button class="btn primary wide" data-action="copy-text" data-copy="${escapeHTML(profile.pin)}">نسخ الرمز</button>
       <button class="btn soft wide" data-action="copy-text" data-copy="${escapeHTML(email.address)}">نسخ الإيميل</button>
-      <button type="button" class="btn ghost wide" data-action="fetch-code" data-email-id="${email.localId}">جلب الكود والروابط</button>
     </div>
     <div class="simple-status-block">
       <span>الحالة الحالية: <strong>${statusLabel(profile.status)}</strong></span>
@@ -1851,7 +1903,7 @@ function stopPolling(showToast = true) {
 // لا تحتاج الضغط على «رسائل» أو «تحديث». عندما تكون الصفحة مفتوحة
 // يفحص الموقع جميع الإيميلات النشطة ويُحدّث الصندوق فور وصول رسالة جديدة.
 // =========================
-const WEBSITE_AUTO_CHECK_MS = 8000;
+const WEBSITE_AUTO_CHECK_MS = 5000;
 let websiteAutoMonitorTimer = null;
 let websiteAutoMonitorBusy = false;
 
@@ -1888,6 +1940,9 @@ async function autoCheckWebsiteMailboxes() {
           }
         }
 
+        // خزّن أحدث الرسائل في واجهة الموقع لتظهر تلقائياً في الصفحة الرئيسية.
+        ui.liveInboxByEmail[email.localId] = messages.slice(0, 10);
+
         // إذا صندوق هذا الإيميل مفتوح، حدّث القائمة مباشرة بدون أي زر.
         if (ui.inboxEmailId === email.localId) {
           ui.inboxMessages = messages;
@@ -1902,6 +1957,7 @@ async function autoCheckWebsiteMailboxes() {
     }
   } finally {
     if (changed) saveState({ silent: true });
+    if (ui.view === 'home') renderHome();
     websiteAutoMonitorBusy = false;
   }
 }
