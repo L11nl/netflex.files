@@ -14,7 +14,7 @@ const PORT = Number(process.env.PORT || 3000);
 const GENERATOR_BASE = 'https://generator.email';
 const GENERATOR_DOMAIN = '5xu.vn';
 const TELEGRAM_BOT_TOKEN = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
-const MAIL_READER_BUILD = '2026-08-08-inbox9-cookie-v5-dedup';
+const MAIL_READER_BUILD = '2026-08-08-inbox9-fast-v6-smart-links';
 const TELEGRAM_ALLOWED_IDS = new Set(
   String(process.env.TELEGRAM_ALLOWED_IDS || '')
     .split(',')
@@ -91,6 +91,116 @@ function dedupeUrlsInText(text = '') {
     if (line.trim()) output.push(line.trim());
   }
   return output.join('\n');
+}
+
+function stripInvisibleNoise(text = '') {
+  return String(text || '')
+    .replace(/[\u00AD\u034F\u061C\u115F\u1160\u17B4\u17B5\u180B-\u180F\u200B-\u200F\u202A-\u202E\u2060-\u206F\u3164\uFE00-\uFE0F\uFEFF\uFFA0]/g, '')
+    .replace(/[ \t]{2,}/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function stripUrlsFromText(text = '') {
+  return stripInvisibleNoise(String(text || '').replace(/https?:\/\/[^\s<>'\"]+/gi, ' '));
+}
+
+function isStaticAssetUrl(value = '') {
+  const url = normalizeUrl(value);
+  if (!url) return true;
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+    const pathname = parsed.pathname.toLowerCase();
+    if (host === 'beaconimages.netflix.net' || host === 'assets.nflxext.com') return true;
+    if (/\.(?:png|jpe?g|gif|webp|svg|ico|css|js|woff2?|ttf|eot)(?:$|\?)/i.test(pathname)) return true;
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+function canonicalLinkKey(value = '') {
+  const url = normalizeUrl(value);
+  if (!url) return '';
+  try {
+    const parsed = new URL(url);
+    // هذه باراميترات تتبع فقط؛ تجاهلها عند اكتشاف التكرار مع إبقاء الرابط الأصلي عند الإرسال.
+    for (const key of [...parsed.searchParams.keys()]) {
+      if (/^(?:utm_.+|lkid|lnktrk|g|src|source|campaign)$/i.test(key)) parsed.searchParams.delete(key);
+    }
+    parsed.hash = parsed.hash === '#no_ul' ? '#no_ul' : '';
+    return parsed.toString();
+  } catch {
+    return url;
+  }
+}
+
+function uniqueUserFacingLinks(values = []) {
+  const out = [];
+  const seen = new Set();
+  for (const value of Array.isArray(values) ? values : []) {
+    const url = normalizeUrl(value);
+    if (!url || isStaticAssetUrl(url)) continue;
+    const key = canonicalLinkKey(url) || url;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(url);
+  }
+  return out;
+}
+
+function isLowPriorityLink(url = '', label = '') {
+  const hay = `${url} ${label}`.toLowerCase();
+  return /(?:privacy|termsofuse|terms(?:\/|\?|$)|corpinfo|contactus|\/help(?:\/|\?|$)|unsubscribe|url_(?:logo|contact|help|help_questions|corp_info|terms|privacy|email|src)|legal|cookie(?:s|policy)?)/i.test(hay);
+}
+
+function importantLinkScore(url = '', label = '') {
+  const normalized = normalizeUrl(url);
+  if (!normalized || isStaticAssetUrl(normalized)) return -1000;
+  const hay = `${normalized} ${label}`.toLowerCase();
+  let score = 0;
+  if (isLowPriorityLink(normalized, label)) score -= 180;
+  if (/(?:verify|verification|confirm|confirmation|activate|activation|complete|finish|continue|signup|sign-up|register|create.?account|reset.?password|magic.?link|signin|sign-in|login|authenticate|authorization|\/epr(?:\?|$)|[?&](?:code|token|otp|key)=)/i.test(hay)) score += 220;
+  if (/(?:إنشاء\s*حساب|إنشاء\s*الحساب|تأكيد|تحقق|تفعيل|إكمال|اكمال|متابعة|تسجيل\s*الدخول|إعادة\s*تعيين|رابط\s*الدخول)/i.test(`${label} ${hay}`)) score += 220;
+  if (/netflix\.com\/epr/i.test(normalized)) score += 350;
+  if (/url_logo|url_src|url_email/i.test(hay)) score -= 250;
+  return score;
+}
+
+function selectImportantLinks(links = [], linkDetails = []) {
+  const clean = uniqueUserFacingLinks(links);
+  const detailMap = new Map();
+  for (const item of Array.isArray(linkDetails) ? linkDetails : []) {
+    const url = normalizeUrl(item?.url || '');
+    if (!url) continue;
+    const key = canonicalLinkKey(url) || url;
+    if (!detailMap.has(key)) detailMap.set(key, String(item?.label || '').trim());
+  }
+  const ranked = clean.map((url, index) => {
+    const key = canonicalLinkKey(url) || url;
+    const label = detailMap.get(key) || '';
+    return { url, label, score: importantLinkScore(url, label), index };
+  }).sort((a, b) => (b.score - a.score) || (a.index - b.index));
+
+  const positive = ranked.filter((item) => item.score > 0).map((item) => item.url);
+  if (positive.length) return positive.slice(0, 3);
+  // إن لم توجد إشارة صريحة، خذ أول رابط لا يبدو رابط مساعدة/سياسة/تتبع.
+  const fallback = ranked.find((item) => !isLowPriorityLink(item.url, item.label) && item.score > -100);
+  return fallback ? [fallback.url] : [];
+}
+
+function compactMessageSnippet(text = '', maxLength = 650) {
+  let value = stripUrlsFromText(text)
+    .replace(/\s*­+\s*/g, ' ')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n{2,}/g, '\n')
+    .trim();
+  if (!value) return '';
+  // أوقف النص عند بداية تذييل شائع حتى لا نرسل سياسات/مساعدة طويلة داخل التنبيه.
+  const footer = value.search(/(?:هل توجد لديك أسئلة|مركز خدمة العملاء|بنود الاستخدام|الخصوصية|privacy policy|terms of use|need help\?|customer service|unsubscribe)/i);
+  if (footer > 80) value = value.slice(0, footer).trim();
+  return value.length > maxLength ? `${value.slice(0, maxLength).trim()}…` : value;
 }
 
 function extractCodes(text = '') {
@@ -195,61 +305,62 @@ function decodeBasicEntities(value = '') {
 }
 
 function getFullMessageLikePython($, node) {
-  if (!node) return { text: '', htmlBody: '', links: [] };
+  if (!node) return { text: '', htmlBody: '', links: [], linkDetails: [] };
 
-  // نفس فكرة get_full_message في كود Python: ننسخ جسم الرسالة،
-  // ثم نستبدل كل <a> باسم الرابط + الرابط الحقيقي قبل استخراج النص.
+  // نفس منطق كود Python المرسل من المستخدم، لكن نفصل روابط <a> الفعلية
+  // عن صور التتبع والـ assets حتى لا تظهر كرابط للمستخدم.
   const body = $(node).clone();
   const links = [];
+  const linkDetails = [];
   const htmlBody = body.html() || '';
 
-  body.find('a[href]').each((_, el) => {
-    const href = normalizeUrl(decodeBasicEntities($(el).attr('href') || ''));
-    const title = $(el).text().replace(/\s+/g, ' ').trim();
-    if (href) {
-      const isNew = !links.includes(href);
-      if (isNew) links.push(href);
-      // الرابط نفسه يظهر مرة واحدة فقط حتى لو تكرر داخل HTML الرسالة.
-      $(el).replaceWith(`\n${title ? `${title}\n` : ''}${isNew ? `${href}\n` : ''}`);
+  const addLink = (rawUrl, rawLabel = '') => {
+    const href = normalizeUrl(decodeBasicEntities(rawUrl || ''));
+    if (!href || isStaticAssetUrl(href)) return { href: '', isNew: false };
+    const key = canonicalLinkKey(href) || href;
+    const already = linkDetails.some((item) => (canonicalLinkKey(item.url) || item.url) === key);
+    if (!already) {
+      links.push(href);
+      linkDetails.push({ url: href, label: stripInvisibleNoise(rawLabel || '') });
     }
+    return { href, isNew: !already };
+  };
+
+  body.find('a[href]').each((_, el) => {
+    const title = $(el).text().replace(/\s+/g, ' ').trim();
+    const { href, isNew } = addLink($(el).attr('href') || '', title);
+    if (!href) { $(el).replaceWith(title || ''); return; }
+    $(el).replaceWith(`\n${title ? `${title}\n` : ''}${isNew ? `${href}\n` : ''}`);
   });
 
-  // بعض الرسائل تكون داخل iframe/srcdoc في HTML المصدر.
   body.find('iframe').each((_, el) => {
     const embedded = $(el).attr('srcdoc') || $(el).attr('data-srcdoc') || $(el).attr('data-content') || '';
-    if (embedded) {
-      const inner = cheerio.load(decodeBasicEntities(embedded));
-      inner('a[href]').each((__, a) => {
-        const href = normalizeUrl(decodeBasicEntities(inner(a).attr('href') || ''));
-        const title = inner(a).text().replace(/\s+/g, ' ').trim();
-        if (!href) return;
-        const isNew = !links.includes(href);
-        if (isNew) links.push(href);
-        inner(a).replaceWith(`\n${title ? `${title}\n` : ''}${isNew ? `${href}\n` : ''}`);
-      });
-      // لا نلحق قائمة links العامة هنا؛ كانت تسبب تكرار الروابط مع كل iframe.
-      $(el).replaceWith(`\n${inner.root().text()}\n`);
-    }
+    if (!embedded) return;
+    const inner = cheerio.load(decodeBasicEntities(embedded));
+    inner('a[href]').each((__, a) => {
+      const title = inner(a).text().replace(/\s+/g, ' ').trim();
+      const { href, isNew } = addLink(inner(a).attr('href') || '', title);
+      if (!href) { inner(a).replaceWith(title || ''); return; }
+      inner(a).replaceWith(`\n${title ? `${title}\n` : ''}${isNew ? `${href}\n` : ''}`);
+    });
+    $(el).replaceWith(`\n${inner.root().text()}\n`);
   });
 
   const lines = body.text()
     .split(/\r?\n/)
-    .map((line) => line.replace(/\s+/g, ' ').trim())
+    .map((line) => stripInvisibleNoise(line.replace(/\s+/g, ' ').trim()))
     .filter(Boolean);
 
   let text = lines.join('\n');
 
-  // التقط الروابط المكتوبة كنص أو الموجودة داخل HTML حتى لو لم تكن داخل <a>.
-  const plainUrls = `${text}\n${htmlBody}`.match(/https?:\/\/[^\s<>'"]+/gi) || [];
-  for (const raw of plainUrls) {
-    const url = normalizeUrl(decodeBasicEntities(raw.replace(/[),.;"'<>]+$/g, '')));
-    if (url && !links.includes(url)) links.push(url);
-  }
+  // التقط الروابط المكتوبة كنص فقط. لا نفحص HTML الخام لأنه يحتوي img/src وbeacons.
+  const plainUrls = text.match(/https?:\/\/[^\s<>'\"]+/gi) || [];
+  for (const raw of plainUrls) addLink(raw.replace(/[),.;\"'<>]+$/g, ''), '');
 
-  text = dedupeUrlsInText(text);
-  const dedupedLinks = uniqueUrls(links);
+  text = dedupeUrlsInText(stripInvisibleNoise(text));
+  const dedupedLinks = uniqueUserFacingLinks(links);
   if (!text && dedupedLinks.length) text = dedupedLinks.join('\n');
-  return { text, htmlBody, links: dedupedLinks };
+  return { text, htmlBody, links: dedupedLinks, linkDetails };
 }
 
 function normalizeGeneratorColumns($, root) {
@@ -296,7 +407,8 @@ function parseMailbox(html, email) {
     let subject = subjectRaw || 'بدون عنوان';
     let text = bodyData.text;
     const htmlBody = bodyData.htmlBody;
-    let links = uniqueUrls(bodyData.links);
+    let links = uniqueUserFacingLinks(bodyData.links);
+    const linkDetails = Array.isArray(bodyData.linkDetails) ? [...bodyData.linkDetails] : [];
 
     // إذا كانت بنية الصفحة مختلفة قليلاً، نقرأ بيانات To/From/Subject/Received من أقرب حاوية.
     const anchorNode = bodies[i] || senders[i] || subjects[i] || null;
@@ -338,13 +450,23 @@ function parseMailbox(html, email) {
       if (fallback) text = fallback;
     }
 
-    const allUrls = `${text}\n${htmlBody}\n${containerHtml}`.match(/https?:\/\/[^\s<>'"]+/gi) || [];
-    for (const raw of allUrls) {
-      const url = normalizeUrl(decodeBasicEntities(raw.replace(/[),.;"'<>]+$/g, '')));
-      if (url && !links.includes(url)) links.push(url);
+    // خذ روابط النقر الحقيقية من الحاوية أيضاً، لكن لا تجمع src الخاصة بالصور والتتبع.
+    if (container?.length) {
+      container.find('a[href]').each((_, el) => {
+        const url = normalizeUrl(decodeBasicEntities($(el).attr('href') || ''));
+        if (!url || isStaticAssetUrl(url)) return;
+        const label = stripInvisibleNoise($(el).text().replace(/\s+/g, ' ').trim());
+        links.push(url);
+        linkDetails.push({ url, label });
+      });
     }
-    links = uniqueUrls(links);
-    text = dedupeUrlsInText(text);
+    const textUrls = String(text || '').match(/https?:\/\/[^\s<>'\"]+/gi) || [];
+    for (const raw of textUrls) {
+      const url = normalizeUrl(decodeBasicEntities(raw.replace(/[),.;\"'<>]+$/g, '')));
+      if (url && !isStaticAssetUrl(url)) links.push(url);
+    }
+    links = uniqueUserFacingLinks(links);
+    text = dedupeUrlsInText(stripInvisibleNoise(text));
     if (!text && links.length) text = links.join('\n');
 
     const normalizedSender = String(senderText || '').trim();
@@ -358,7 +480,9 @@ function parseMailbox(html, email) {
     const createdAt = receivedMatch?.[1]
       ? (extractTimestamp(receivedMatch[1]) || new Date().toISOString())
       : (extractTimestamp(containerText) || '');
-    const codes = extractCodes(`${normalizedSubject}\n${text}\n${links.join('\n')}`);
+    // لا نستخرج OTP من داخل UUID أو query params في الروابط (مثل 4922 داخل g=...).
+    const codes = extractCodes(`${normalizedSubject}\n${stripUrlsFromText(text)}`);
+    const importantLinks = selectImportantLinks(links, linkDetails);
     const toAddress = normalizeAddress(toMatch?.[1] || email);
 
     // استخدم بصمة مستقرة لا تعتمد على وقت الفحص حتى لا تتكرر الرسالة كل دورة.
@@ -384,6 +508,8 @@ function parseMailbox(html, email) {
       verifications: codes,
       codes,
       links,
+      importantLinks,
+      linkDetails,
       _generator: true
     });
   }
@@ -436,6 +562,26 @@ async function requestGeneratorWithCookies(url, jar, baseHeaders) {
   throw new Error('Generator.email أعاد تحويلات كثيرة جداً أثناء فتح الصندوق.');
 }
 
+const mailboxSessionCache = new Map();
+
+function getCachedMailboxJar(address) {
+  const cached = mailboxSessionCache.get(address);
+  if (!cached || Date.now() - cached.updatedAt > 25 * 60 * 1000) return new Map();
+  return new Map(cached.jar || []);
+}
+
+function rememberMailboxJar(address, jar) {
+  mailboxSessionCache.set(address, { jar: Array.from(jar.entries()), updatedAt: Date.now() });
+  if (mailboxSessionCache.size > 500) {
+    const oldest = [...mailboxSessionCache.entries()].sort((a, b) => a[1].updatedAt - b[1].updatedAt).slice(0, 100);
+    oldest.forEach(([key]) => mailboxSessionCache.delete(key));
+  }
+}
+
+function htmlHasMailboxTable(html = '') {
+  try { return cheerio.load(String(html || ''))('#email-table').length > 0; } catch { return false; }
+}
+
 async function fetchMailboxHtml(email) {
   const address = normalizeAddress(email);
   const [username, domain] = address.split('@');
@@ -443,59 +589,41 @@ async function fetchMailboxHtml(email) {
   const bootstrapUrl = `${GENERATOR_BASE}/${domain}/${username}`;
 
   const headers = {
-    // نفس User-Agent الذي في كود Python الذي أثبت أنه يعمل.
     'User-Agent': 'Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 Chrome/136.0 Mobile Safari/537.36',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
     'Accept-Language': 'en-US,en;q=0.9',
-    'Cache-Control': 'no-cache',
+    'Cache-Control': 'no-cache, no-store, max-age=0',
     'Pragma': 'no-cache'
   };
 
-  // requests في Python يحتفظ بالكوكيز أثناء التحويلات تلقائياً.
-  // Axios لا يفعل ذلك بنفس الصورة، لذلك نطبّق jar صغيراً يدوياً ثم نفتح inbox9 نفسه.
-  const jar = new Map();
-  const candidates = [];
+  // المسار السريع: بعد أول جلسة ناجحة نفتح inbox9 مباشرة بطلب واحد فقط.
+  // هذا يقلل زمن اكتشاف الرسالة بشكل كبير مقارنة بفتح bootstrap في كل دورة.
+  const jar = getCachedMailboxJar(address);
   let lastError = null;
 
   try {
-    const boot = await requestGeneratorWithCookies(bootstrapUrl, jar, headers);
-    if (boot.html) candidates.push({ ...boot, source: bootstrapUrl, kind: 'bootstrap' });
+    const direct = await requestGeneratorWithCookies(inboxUrl, jar, { ...headers, Referer: bootstrapUrl });
+    if (direct.html && htmlHasMailboxTable(direct.html)) {
+      rememberMailboxJar(address, jar);
+      return { html: direct.html, source: inboxUrl, finalUrl: direct.finalUrl, messageCount: parseMailbox(direct.html, address).length };
+    }
   } catch (error) {
     lastError = error;
   }
 
+  // إذا لم تكن الجلسة مهيأة، نفذ نفس خطوة Python /{domain}/{username} مرة واحدة ثم عد إلى inbox9.
   try {
-    // هذا هو الرابط الذي طلبه المستخدم حرفياً؛ يتم فتحه على السيرفر وبنفس جلسة الكوكيز.
-    const inbox = await requestGeneratorWithCookies(inboxUrl, jar, {
-      ...headers,
-      Referer: bootstrapUrl
-    });
-    if (inbox.html) candidates.push({ ...inbox, source: inboxUrl, kind: 'inbox9' });
+    await requestGeneratorWithCookies(bootstrapUrl, jar, headers);
+    const inbox = await requestGeneratorWithCookies(inboxUrl, jar, { ...headers, Referer: bootstrapUrl });
+    if (inbox.html && htmlHasMailboxTable(inbox.html)) {
+      rememberMailboxJar(address, jar);
+      return { html: inbox.html, source: inboxUrl, finalUrl: inbox.finalUrl, messageCount: parseMailbox(inbox.html, address).length };
+    }
   } catch (error) {
     lastError = error;
   }
 
-  // اختر النسخة التي تحتوي أكبر عدد رسائل حقيقية. عند التعادل نفضّل inbox9.
-  let best = null;
-  for (const candidate of candidates) {
-    const $ = cheerio.load(candidate.html);
-    if (!$('#email-table').length) continue;
-    const count = parseMailbox(candidate.html, address).length;
-    const score = count * 100 + (candidate.kind === 'inbox9' ? 10 : 0);
-    if (!best || score > best.score) best = { ...candidate, score, count };
-  }
-
-  if (best) {
-    return { html: best.html, source: inboxUrl, finalUrl: best.finalUrl, messageCount: best.count };
-  }
-
-  if (candidates.length) {
-    const error = new Error('تم فتح Generator.email لكن لم يظهر جدول email-table في المصدر الذي أعاده السيرفر.');
-    error.statusCode = 502;
-    throw error;
-  }
-
-  throw lastError || new Error('تعذر فتح صندوق البريد من Generator.email.');
+  throw lastError || new Error('تم فتح Generator.email لكن لم يظهر جدول email-table لصندوق البريد.');
 }
 
 async function getMailbox(email) {
@@ -519,7 +647,7 @@ async function getMailbox(email) {
 // =========================
 
 const EMAIL_LIFETIME_MS = 6 * 24 * 60 * 60 * 1000;
-const AUTO_CHECK_INTERVAL_MS = Math.max(3000, Number(process.env.AUTO_CHECK_INTERVAL_MS || 3000));
+const AUTO_CHECK_INTERVAL_MS = Math.max(1200, Number(process.env.AUTO_CHECK_INTERVAL_MS || 1500));
 const DEFAULT_PINS = ['1212', '1001', '2121', '2026', '2002'];
 
 function randomGeneratorUsername() {
@@ -794,10 +922,18 @@ function profileDetailKeyboard(email, profile) {
 
 function messageInlineKeyboard(message) {
   const rows = [];
-  const codes = Array.isArray(message.codes) ? message.codes.slice(0, 5) : [];
-  const links = uniqueUrls(message.links).slice(0, 6);
+  const codes = Array.isArray(message?.codes) ? message.codes.slice(0, 5) : [];
+  const allLinks = uniqueUserFacingLinks(message?.links || []);
+  const importantLinks = uniqueUserFacingLinks(message?.importantLinks || selectImportantLinks(allLinks, message?.linkDetails || [])).slice(0, 2);
   for (const code of codes) rows.push([{ text: `📋 نسخ ${code}`, copy_text: { text: String(code) } }]);
-  links.forEach((url, index) => rows.push([{ text: `🔗 فتح الرابط ${index + 1}`, url }]));
+  importantLinks.forEach((url) => rows.push([{ text: '🔗 فتح الرابط المهم', url }]));
+
+  const to = normalizeAddress(message?.to || '');
+  const username = to.split('@')[0] || '';
+  const shortId = String(message?.id || '').replace(/^gen-/, '');
+  if (allLinks.length && /^[a-z0-9._-]{1,32}$/i.test(username) && /^[a-f0-9]{8,40}$/i.test(shortId)) {
+    rows.push([{ text: '🔗 جلب كل الروابط', callback_data: `alllinks:${username}:${shortId}` }]);
+  }
   return rows.length ? { inline_keyboard: rows } : undefined;
 }
 
@@ -808,13 +944,18 @@ function formatTelegramMessage(message, index = 0, emailAddress = '') {
     ? (senderName && senderName !== senderAddress ? `${senderName} <${senderAddress}>` : senderAddress)
     : (senderName || 'غير معروف');
   const subject = message?.subject || 'بدون عنوان';
-  const body = dedupeUrlsInText(String(message?.text || message?.intro || '').trim());
   const received = message?.receivedAt || message?.createdAt || '';
-  const codes = Array.isArray(message?.codes) && message.codes.length ? `\n\n🔢 الأكواد: ${message.codes.join(' - ')}` : '';
-  const bodyUrls = new Set(urlsInText(body));
-  const extraLinks = uniqueUrls(message?.links).filter((url) => !bodyUrls.has(url)).slice(0, 10);
-  // لا نعيد طباعة الرابط في قسم الروابط إذا كان موجوداً أصلاً داخل نص الرسالة.
-  const links = extraLinks.length ? `\n\n🔗 الروابط:\n${extraLinks.join('\n')}` : '';
+  const codesArray = Array.isArray(message?.codes) ? message.codes.slice(0, 5) : [];
+  const importantLinks = uniqueUserFacingLinks(message?.importantLinks || selectImportantLinks(message?.links || [], message?.linkDetails || [])).slice(0, 2);
+  const snippet = compactMessageSnippet(message?.text || message?.intro || '');
+
+  const payload = [];
+  if (codesArray.length) payload.push(`🔢 الكود: ${codesArray.join(' - ')}`);
+  if (importantLinks.length) payload.push(`🔗 الرابط المهم:\n${importantLinks.join('\n')}`);
+  // إذا وجدنا كوداً أو رابطاً مهماً لا نغرق المستخدم بتذييل HTML الطويل.
+  if (!payload.length && snippet) payload.push(`💬 نص الرسالة:\n${snippet}`);
+  if (!payload.length) payload.push('(لم يتم العثور على نص أو رابط مهم واضح)');
+
   return [
     index >= 0 ? `📬 الرسالة ${index + 1}` : '🔔 وصلت رسالة جديدة',
     `📧 إلى: ${message?.to || emailAddress || ''}`,
@@ -824,9 +965,7 @@ function formatTelegramMessage(message, index = 0, emailAddress = '') {
     '',
     '━━━━━━━━━━━━━━',
     '',
-    body || (uniqueUrls(message?.links).length ? uniqueUrls(message?.links).join('\n') : '(لا يوجد نص ظاهر؛ تم عرض جميع البيانات التي أمكن استخراجها)'),
-    codes,
-    links
+    ...payload
   ].filter((x) => x !== '').join('\n');
 }
 
@@ -863,6 +1002,30 @@ async function sendFormattedMessage(bot, chatId, message, index, emailAddress) {
       disable_web_page_preview: true,
       ...(isLast && messageInlineKeyboard(message) ? { reply_markup: messageInlineKeyboard(message) } : {})
     });
+  }
+}
+
+async function sendAllMessageLinks(bot, chatId, username, shortId) {
+  const address = `${String(username || '').toLowerCase()}@${GENERATOR_DOMAIN}`;
+  if (!isAllowedEmail(address)) throw new Error('عنوان البريد غير صالح.');
+  const { messages } = await getMailbox(address);
+  const fullId = String(shortId || '').startsWith('gen-') ? String(shortId) : `gen-${shortId}`;
+  const message = messages.find((item) => item.id === fullId) || messages[0];
+  if (!message) {
+    await bot.sendMessage(chatId, `📭 لم أجد الرسالة حالياً في ${address}.`);
+    return;
+  }
+  const links = uniqueUserFacingLinks(message.links || []);
+  if (!links.length) {
+    await bot.sendMessage(chatId, '🔗 لا توجد روابط قابلة للفتح داخل هذه الرسالة.');
+    return;
+  }
+
+  const lines = [`🔗 كل الروابط الموجودة في الرسالة`, `📧 ${address}`, ''];
+  links.forEach((url, index) => lines.push(`${index + 1}. ${url}`));
+  const chunks = splitTelegramText(lines.join('\n'));
+  for (const chunk of chunks) {
+    await safeSendMessage(bot, chatId, chunk, { disable_web_page_preview: true });
   }
 }
 
@@ -1010,10 +1173,20 @@ async function monitorAllMailboxes(bot) {
   monitorBusy = true;
   try {
     await cleanupExpiredEmails(bot);
+    const jobs = [];
     for (const [chatId, chat] of Object.entries(botState.chats)) {
       if (!isTelegramChatAllowed(chatId)) continue;
       for (const email of chat.emails) {
         if (new Date(email.expiresAt).getTime() <= Date.now()) continue;
+        jobs.push({ chatId, email });
+      }
+    }
+
+    // ثلاثة صناديق بالتوازي: أسرع بكثير مع عدد إيميلات كبير بدون فتح عشرات الطلبات دفعة واحدة.
+    const concurrency = 3;
+    for (let start = 0; start < jobs.length; start += concurrency) {
+      const batch = jobs.slice(start, start + concurrency);
+      await Promise.allSettled(batch.map(async ({ chatId, email }) => {
         try {
           const { messages } = await getMailbox(email.address);
           email.lastCheckedAt = new Date().toISOString();
@@ -1021,19 +1194,16 @@ async function monitorAllMailboxes(bot) {
           const fresh = messages.filter((message) => !seen.has(message.id)).reverse();
           for (const message of messages) seen.add(message.id);
           email.seenMessageIds = Array.from(seen).slice(-200);
-          if (fresh.length) {
-            for (const message of fresh.slice(-10)) {
-              await sendFormattedMessage(bot, chatId, message, -1, email.address);
-            }
+          for (const message of fresh.slice(-10)) {
+            await sendFormattedMessage(bot, chatId, message, -1, email.address);
           }
-          saveBotState();
         } catch (error) {
           console.warn(`[telegram-monitor] ${email.address}:`, error?.message || error);
         }
-        // تخفيف الطلبات على Generator.email عند وجود عدة صناديق.
-        await new Promise((resolve) => setTimeout(resolve, 600));
-      }
+      }));
+      if (start + concurrency < jobs.length) await new Promise((resolve) => setTimeout(resolve, 80));
     }
+    if (jobs.length) saveBotState();
   } finally {
     monitorBusy = false;
   }
@@ -1087,7 +1257,8 @@ function startTelegramBot() {
       if (data === 'noop') return;
       if (data === 'create:random') {
         const { email } = addBotEmail(chatId, newGeneratorEmail(), 'random');
-        await establishMailboxBaseline(email);
+        email.seenMessageIds = [];
+        saveBotState();
         await bot.sendMessage(chatId, `✅ تم إنشاء الإيميل العشوائي\n\n📧 ${email.address}\n⏳ سيُحذف من البوت بعد 6 أيام.`, { reply_markup: telegramKeyboard() });
         await showEmailDetail(bot, chatId, email.id);
         return;
@@ -1110,6 +1281,15 @@ function startTelegramBot() {
         const emailId = data.split(':')[1];
         setSelectedBotEmail(chatId, emailId);
         await sendMailboxToTelegram(bot, chatId, emailId);
+        return;
+      }
+      if (data.startsWith('alllinks:')) {
+        const [, username, shortId] = data.split(':');
+        try {
+          await sendAllMessageLinks(bot, chatId, username, shortId);
+        } catch (error) {
+          await bot.sendMessage(chatId, `❌ تعذر جلب كل الروابط الآن.\n${String(error?.message || error)}`);
+        }
         return;
       }
       if (data.startsWith('pin:')) {
@@ -1187,7 +1367,8 @@ function startTelegramBot() {
         }
         chat.pending = null;
         const { email, created } = addBotEmail(chatId, `${local}@5xu.vn`, 'manual');
-        await establishMailboxBaseline(email);
+        if (created) email.seenMessageIds = [];
+        saveBotState();
         await bot.sendMessage(chatId, `${created ? '✅ تم إضافة' : 'ℹ️ الإيميل موجود مسبقاً وتم اختياره'}\n\n📧 ${email.address}\n⏳ سيُحذف من البوت بعد 6 أيام.`, { reply_markup: telegramKeyboard() });
         await showEmailDetail(bot, chatId, email.id);
         return;
