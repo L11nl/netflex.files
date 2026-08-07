@@ -223,6 +223,23 @@ const EMAIL_LIFETIME_MS = 6 * 24 * 60 * 60 * 1000;
 const AUTO_CHECK_INTERVAL_MS = Math.max(15000, Number(process.env.AUTO_CHECK_INTERVAL_MS || 30000));
 const DEFAULT_PINS = ['1212', '1001', '2121', '2026', '2002'];
 
+function randomGeneratorUsername() {
+  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  for (let tries = 0; tries < 50; tries += 1) {
+    const length = 5 + crypto.randomInt(0, 2); // 5 أو 6 خانات
+    let value = '';
+    for (let i = 0; i < length; i += 1) {
+      value += chars[crypto.randomInt(0, chars.length)];
+    }
+    if (/[a-z]/.test(value) && /\d/.test(value)) return value;
+  }
+  return `a${String(Date.now()).slice(-4)}`;
+}
+
+function newGeneratorEmail() {
+  return `${randomGeneratorUsername()}@${GENERATOR_DOMAIN}`;
+}
+
 function createBotProfile(number) {
   return {
     number,
