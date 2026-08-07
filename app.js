@@ -1,4 +1,4 @@
-const APP_BUILD = "2026-08-07-refresh-no-redirect-v3";
+const APP_BUILD = "2026-08-07-fetch-code-no-redirect-v4";
 'use strict';
 
 /* تطبيق ثابت بالكامل: جميع البيانات تحفظ داخل LocalStorage فقط. */
@@ -513,7 +513,7 @@ function renderEmailDetail() {
     <section class="card account-summary simple-account-summary">
       <div class="simple-account-actions">
         <button class="btn soft" data-action="copy-text" data-copy="${escapeHTML(email.address)}">نسخ الإيميل</button>
-        <button class="btn primary" data-action="fetch-code" data-email-id="${email.localId}">جلب الكود والروابط</button>
+        <button type="button" class="btn primary" data-action="fetch-code" data-email-id="${email.localId}">جلب الكود والروابط</button>
         <button class="btn ghost" data-action="change-profile-icons" data-email-id="${email.localId}">تغيير الرموز</button>
       </div>
       ${!remoteInbox ? '<p class="helper simple-note">هذا الإيميل مضاف للتنظيم فقط. جلب الرسائل يعمل مع الإيميلات المنشأة تلقائياً من Generator.email.</p>' : ''}
@@ -671,7 +671,7 @@ function openProfileSheet(emailId, profileNumber) {
     <div class="profile-quick-actions">
       <button class="btn primary wide" data-action="copy-text" data-copy="${escapeHTML(profile.pin)}">نسخ الرمز</button>
       <button class="btn soft wide" data-action="copy-text" data-copy="${escapeHTML(email.address)}">نسخ الإيميل</button>
-      <button class="btn ghost wide" data-action="fetch-code" data-email-id="${email.localId}">جلب الكود والروابط</button>
+      <button type="button" class="btn ghost wide" data-action="fetch-code" data-email-id="${email.localId}">جلب الكود والروابط</button>
     </div>
     <div class="simple-status-block">
       <span>الحالة الحالية: <strong>${statusLabel(profile.status)}</strong></span>
@@ -1648,15 +1648,12 @@ async function openMessage(messageId, archiveId = '') {
   }
 }
 
-async function fetchLatestCode(emailId, { openExternal = false } = {}) {
+async function fetchLatestCode(emailId) {
   const email = getEmail(emailId);
   if (!email) return;
   const generatorUrl = isGeneratorEmail(email) ? generatorInboxUrl(email) : '';
-  // الضغط الأول على «جلب الكود والروابط» يفتح الصندوق الأصلي مرة واحدة.
-  // أما أزرار «تحديث» داخل النافذة فتجلب الرسائل فقط بدون فتح أو تحويل المستخدم إلى Generator.email.
-  if (generatorUrl && openExternal) {
-    try { window.open(generatorUrl, '_blank', 'noopener,noreferrer'); } catch (_) {}
-  }
+  // مهم: هذه الوظيفة لا تفتح Generator.email ولا تغيّر الصفحة نهائياً.
+  // يتم بناء رابط الصندوق داخلياً ثم قراءة HTML بالخلفية واستخراج الرسالة والكود والروابط.
   if (!hasRemoteInbox(email)) {
     toast('جلب الكود والروابط يعمل فقط مع الإيميلات التي تم إنشاؤها تلقائياً.', 'info', 5000);
     return;
@@ -1680,7 +1677,7 @@ async function fetchLatestCode(emailId, { openExternal = false } = {}) {
         <div class="sheet-title"><h2>جلب الكود والروابط</h2><button class="close-btn" data-action="close-sheet">×</button></div>
         ${emptyState('📭', 'لا توجد رسائل حالياً', 'تم فحص رابط صندوق البريد نفسه ولم تظهر رسالة حتى الآن.')}
         ${generatorUrl ? `<a class="btn ghost wide" href="${escapeHTML(generatorUrl)}" target="_blank" rel="noopener noreferrer">فتح الصندوق الأصلي</a>` : ''}
-        <button class="btn primary wide" data-action="refresh-code-only" data-email-id="${email.localId}">تحديث</button>
+        <button type="button" class="btn primary wide" data-action="refresh-code-only" data-email-id="${email.localId}">تحديث</button>
       `);
       return;
     }
@@ -1705,7 +1702,7 @@ async function fetchLatestCode(emailId, { openExternal = false } = {}) {
       openSheet(`
         <div class="sheet-title"><h2>جلب الكود والروابط</h2><button class="close-btn" data-action="close-sheet">×</button></div>
         ${emptyState('🔎', 'لم يتم العثور على كود أو رابط', 'تم فحص أحدث الرسائل، لكن لا يوجد كود من 4 أرقام أو رابط واضح.')}
-        <button class="btn primary wide" data-action="refresh-code-only" data-email-id="${email.localId}">تحديث</button>
+        <button type="button" class="btn primary wide" data-action="refresh-code-only" data-email-id="${email.localId}">تحديث</button>
       `);
       return;
     }
@@ -1721,11 +1718,17 @@ async function fetchLatestCode(emailId, { openExternal = false } = {}) {
       ${renderFetchedLinks(links)}
       <p class="helper code-source">${escapeHTML(matchedMessage?.subject || 'آخر رسالة وصلت')}</p>
       ${generatorUrl ? `<a class="btn ghost wide" href="${escapeHTML(generatorUrl)}" target="_blank" rel="noopener noreferrer">فتح الصندوق الأصلي</a>` : ''}
-      <button class="btn ghost wide" data-action="refresh-code-only" data-email-id="${email.localId}">تحديث</button>
+      <button type="button" class="btn ghost wide" data-action="refresh-code-only" data-email-id="${email.localId}">تحديث</button>
     `);
   } catch (error) {
-    toast(error.message || 'تعذر جلب الكود أو الروابط. تحقق من الإنترنت وحاول مرة أخرى.', 'error', 6000);
-    closeSheet();
+    const message = error.message || 'تعذر جلب الكود أو الروابط. تحقق من الإنترنت وحاول مرة أخرى.';
+    openSheet(`
+      <div class="sheet-title"><h2>جلب الكود والروابط</h2><button class="close-btn" data-action="close-sheet">×</button></div>
+      <div class="notice">${escapeHTML(message)}</div>
+      <button type="button" class="btn primary wide" data-action="refresh-code-only" data-email-id="${email.localId}">إعادة المحاولة</button>
+      ${generatorUrl ? `<a class="btn ghost wide" href="${escapeHTML(generatorUrl)}" target="_blank" rel="noopener noreferrer">فتح الصندوق يدوياً</a>` : ''}
+    `);
+    toast(message, 'error', 6000);
   }
 }
 
@@ -2410,12 +2413,12 @@ async function handleClick(event) {
       case 'mark-sold': await markProfileSold(target.dataset.emailId,target.dataset.profileNumber); break;
       case 'restore-profile': await restoreProfile(target.dataset.emailId,target.dataset.profileNumber); break;
       case 'fetch-code':
-        // الزر الرئيسي: يسمح بفتح الصندوق الأصلي مرة واحدة فقط.
-        await fetchLatestCode(target.dataset.emailId, { openExternal: true });
+        // جلب الكود والروابط يتم داخل الموقع فقط، بدون فتح Generator.email.
+        await fetchLatestCode(target.dataset.emailId);
         break;
       case 'refresh-code-only':
-        // زر تحديث داخل نافذة جلب الكود: لا يفتح generator.email ولا يغيّر الصفحة إطلاقاً.
-        await fetchLatestCode(target.dataset.emailId, { openExternal: false });
+        // التحديث يعيد قراءة نفس الصندوق بالخلفية فقط.
+        await fetchLatestCode(target.dataset.emailId);
         break;
       case 'open-inbox': await openInbox(target.dataset.emailId); break;
       case 'refresh-messages': await refreshInbox(); break;
