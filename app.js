@@ -4,11 +4,16 @@
 const STORAGE_KEY = 'cd-mail-profile-manager-v1';
 const GENERATOR_BASE = 'https://generator.email';
 const GENERATOR_HOME_PAGES = ['https://generator.email/', 'https://ja.generator.email/'];
-const GENERATOR_CORS_PROXY = 'https://corsproxy.io/?url=';
-// 5xu.vn كان مستخدماً سابقاً، لكنه لم يعد نطاقاً مناسباً لهذه الواجهة.
+const GENERATOR_DOMAIN = '5xu.vn';
+// نُبقي 5xu.vn كما هو تماماً مثل كود Python المرسل من المستخدم.
 const LEGACY_GENERATOR_DOMAINS = ['5xu.vn'];
-// تُستخدم فقط إذا تعذر جلب قائمة النطاقات الحية من Generator.email.
-const GENERATOR_FALLBACK_DOMAINS = ['casterview.xyz', 'edshol.net', 'rumahpremium.com', 'xazyxe.com', 'sds-awe.top'];
+const GENERATOR_FALLBACK_DOMAINS = [GENERATOR_DOMAIN];
+// أكثر من جسر CORS كخطة احتياط لأن GitHub Pages لا يستطيع قراءة generator.email مباشرة دائماً.
+const GENERATOR_CORS_BUILDERS = [
+  (url) => `https://corsproxy.io/?url=${encodeURIComponent(url)}`,
+  (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+  (url) => `https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(url)}`
+];
 // تبقى هذه المزودات فقط لفتح الحسابات القديمة المحفوظة سابقاً.
 const MAIL_PROVIDERS = [
   { id: 'mailtm', name: 'Mail.tm', apiBase: 'https://api.mail.tm' },
@@ -131,7 +136,7 @@ function normalizeState(raw) {
       token: email.token || '',
       provider,
       apiBase: email.apiBase || (provider === 'mailgw' ? 'https://api.mail.gw' : provider === 'mailtm' ? 'https://api.mail.tm' : ''),
-      generatorDomain: email.generatorDomain || (provider === 'generator' ? (domain || GENERATOR_FALLBACK_DOMAINS[0]) : ''),
+      generatorDomain: email.generatorDomain || (provider === 'generator' ? (domain || GENERATOR_DOMAIN) : ''),
       generatorSeenIds: Array.isArray(email.generatorSeenIds) ? email.generatorSeenIds : [],
       generatorDeletedIds: Array.isArray(email.generatorDeletedIds) ? email.generatorDeletedIds : [],
       localName: email.localName || '',
@@ -1091,7 +1096,7 @@ function buildEmailRecord({ mailTmId, address, password, token, provider = 'gene
   return {
     localId: makeId(), mailTmId: mailTmId || '', address, password: password || '', token: token || '', provider,
     apiBase: apiBase || (provider === 'mailgw' ? 'https://api.mail.gw' : provider === 'mailtm' ? 'https://api.mail.tm' : ''),
-    generatorDomain: provider === 'generator' ? (emailDomain(address) || GENERATOR_FALLBACK_DOMAINS[0]) : '',
+    generatorDomain: provider === 'generator' ? (emailDomain(address) || GENERATOR_DOMAIN) : '',
     generatorSeenIds: [], generatorDeletedIds: [],
     localName: '', createdAt, status: 'active', archivedAt: null, completedAt: null,
     archivedMessageIds: [], profiles
@@ -1224,8 +1229,8 @@ async function createMailAccount() {
   try {
     let address = '';
     for (let attempt = 0; attempt < 40; attempt += 1) {
-      const domain = await getActiveGeneratorDomain();
-      const candidate = `${randomGeneratorUsername()}@${domain}`;
+      // مطابق لفكرة كود Python: اسم 5 أو 6 خانات + النطاق الثابت 5xu.vn.
+      const candidate = `${randomGeneratorUsername()}@${GENERATOR_DOMAIN}`;
       if (!state.emails.some((email) => email.address.toLowerCase() === candidate.toLowerCase())) {
         address = candidate;
         break;
@@ -1233,7 +1238,7 @@ async function createMailAccount() {
     }
     if (!address) throw new Error('تعذر إنشاء اسم إيميل فريد. حاول مرة أخرى.');
 
-    // Generator.email لا يحتاج إنشاء حساب أو كلمة مرور؛ أي اسم على النطاق يصبح صندوقاً قابلاً للاستقبال.
+    // Generator.email لا يحتاج تسجيل حساب أو كلمة مرور.
     const email = buildEmailRecord({
       address,
       password: '',
@@ -1242,6 +1247,7 @@ async function createMailAccount() {
       apiBase: '',
       createdAt: new Date().toISOString()
     });
+    email.generatorDomain = GENERATOR_DOMAIN;
     state.emails.unshift(email);
     state.lastEmailId = email.localId;
     if (!saveState()) return;
@@ -1351,9 +1357,10 @@ function generatorInboxTargets(email) {
   const [username, domain] = address.split('@');
   if (!username || !domain) return [];
   return [
+    // أول مسار هو نفس المسار المستخدم في كود Python حرفياً.
     `${GENERATOR_BASE}/${encodeURIComponent(domain)}/${encodeURIComponent(username)}`,
-    `${GENERATOR_BASE}/${encodeURIComponent(address)}`,
-    `https://hy.generator.email/${encodeURIComponent(address)}`
+    // المسار الحالي الذي تعرضه Generator.email للوصول لصندوق محدد.
+    `${GENERATOR_BASE}/${encodeURIComponent(address)}`
   ];
 }
 
@@ -1372,6 +1379,22 @@ async function fetchTextWithTimeout(url, options = {}, timeoutMs = 22000) {
   }
 }
 
+function isRequestedGeneratorMailboxHtml(html, email) {
+  const source = String(html || '');
+  if (!source) return false;
+  const lower = source.toLowerCase();
+  const address = String(email?.address || '').trim().toLowerCase();
+  const [username, domain] = address.split('@');
+
+  // إذا كانت هناك رسائل فهذه أقوى علامة على أننا داخل صندوق Generator.email الصحيح.
+  if (/id=["']email-table["']|mess_bodiyy|subj_div_45g45gg|from_div_45g45gg/i.test(source)) return true;
+
+  // في الصندوق الفارغ نتأكد أن الصفحة نفسها تشير إلى البريد المطلوب، لا مجرد صفحة Generator.email عامة.
+  if (address && lower.includes(address)) return true;
+  if (username && domain && lower.includes(username) && lower.includes(domain)) return true;
+  return false;
+}
+
 async function fetchGeneratorHtml(email) {
   const targets = generatorInboxTargets(email);
   if (!targets.length) throw new Error('عنوان الإيميل غير صالح.');
@@ -1379,20 +1402,28 @@ async function fetchGeneratorHtml(email) {
 
   for (const target of targets) {
     const freshTarget = `${target}${target.includes('?') ? '&' : '?'}_=${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    // جرب عدة جسور لأن أي جسر عام قد يتوقف أو يحدد الطلبات مؤقتاً.
     const candidates = [
-      `${GENERATOR_CORS_PROXY}${encodeURIComponent(freshTarget)}`,
+      ...GENERATOR_CORS_BUILDERS.map((build) => build(freshTarget)),
       freshTarget
     ];
+
     for (const url of candidates) {
       try {
-        const html = await fetchTextWithTimeout(url, { headers: { 'Accept': 'text/html,application/xhtml+xml' } });
-        if (html && /<html|email-table|mess_bodiyy|subj_div_45g45gg/i.test(html)) return html;
+        const html = await fetchTextWithTimeout(url, {
+          headers: { 'Accept': 'text/html,application/xhtml+xml' }
+        }, 22000);
+
+        // الخطأ السابق كان قبول أي صفحة HTML حتى لو كانت صفحة عامة؛ الآن لا نقبل إلا صندوق البريد المطلوب.
+        if (isRequestedGeneratorMailboxHtml(html, email)) return html;
+        lastError = new Error('تم فتح خدمة البريد لكن لم يتم فتح صندوق هذا الإيميل تحديداً.');
       } catch (error) {
         lastError = error;
       }
     }
   }
-  throw new Error(lastError?.message || 'تعذر فتح صندوق Generator.email. حاول مرة أخرى.');
+
+  throw new Error(lastError?.message || 'تعذر فتح صندوق Generator.email من المتصفح.');
 }
 
 function cleanMessageText(bodyElement) {
@@ -1622,11 +1653,6 @@ async function fetchLatestCode(emailId) {
     toast('جلب الكود والروابط يعمل فقط مع الإيميلات التي تم إنشاؤها تلقائياً.', 'info', 5000);
     return;
   }
-  if (isGeneratorEmail(email) && LEGACY_GENERATOR_DOMAINS.includes(emailDomain(email.address))) {
-    toast('هذا الإيميل يستخدم نطاق 5xu.vn القديم، وهو لم يعد نطاقاً فعالاً في Generator.email. أنشئ إيميلاً جديداً من الموقع.', 'error', 8000);
-    return;
-  }
-
   openSheet(`
     <div class="sheet-title"><h2>جلب الكود والروابط</h2><button class="close-btn" data-action="close-sheet">×</button></div>
     <div class="skeleton" style="height:120px"></div>
