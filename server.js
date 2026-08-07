@@ -14,6 +14,7 @@ const PORT = Number(process.env.PORT || 3000);
 const GENERATOR_BASE = 'https://generator.email';
 const GENERATOR_DOMAIN = '5xu.vn';
 const TELEGRAM_BOT_TOKEN = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
+const MAIL_READER_BUILD = '2026-08-08-inbox9-cookie-v4';
 const TELEGRAM_ALLOWED_IDS = new Set(
   String(process.env.TELEGRAM_ALLOWED_IDS || '')
     .split(',')
@@ -143,122 +144,190 @@ function extractBodyFromNode($, node) {
   return { text, htmlBody, links };
 }
 
+function decodeBasicEntities(value = '') {
+  return String(value || '')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'");
+}
+
+function getFullMessageLikePython($, node) {
+  if (!node) return { text: '', htmlBody: '', links: [] };
+
+  // نفس فكرة get_full_message في كود Python: ننسخ جسم الرسالة،
+  // ثم نستبدل كل <a> باسم الرابط + الرابط الحقيقي قبل استخراج النص.
+  const body = $(node).clone();
+  const links = [];
+  const htmlBody = body.html() || '';
+
+  body.find('a[href]').each((_, el) => {
+    const href = normalizeUrl(decodeBasicEntities($(el).attr('href') || ''));
+    const title = $(el).text().replace(/\s+/g, ' ').trim();
+    if (href) {
+      if (!links.includes(href)) links.push(href);
+      $(el).replaceWith(`\n${title ? `${title}\n` : ''}${href}\n`);
+    }
+  });
+
+  // بعض الرسائل تكون داخل iframe/srcdoc في HTML المصدر.
+  body.find('iframe').each((_, el) => {
+    const embedded = $(el).attr('srcdoc') || $(el).attr('data-srcdoc') || $(el).attr('data-content') || '';
+    if (embedded) {
+      const inner = cheerio.load(decodeBasicEntities(embedded));
+      inner('a[href]').each((__, a) => {
+        const href = normalizeUrl(decodeBasicEntities(inner(a).attr('href') || ''));
+        if (href && !links.includes(href)) links.push(href);
+      });
+      $(el).replaceWith(`\n${inner.root().text()}\n${links.join('\n')}\n`);
+    }
+  });
+
+  const lines = body.text()
+    .split(/\r?\n/)
+    .map((line) => line.replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+
+  let text = lines.join('\n');
+
+  // التقط الروابط المكتوبة كنص أو الموجودة داخل HTML حتى لو لم تكن داخل <a>.
+  const plainUrls = `${text}\n${htmlBody}`.match(/https?:\/\/[^\s<>'"]+/gi) || [];
+  for (const raw of plainUrls) {
+    const url = normalizeUrl(decodeBasicEntities(raw.replace(/[),.;"'<>]+$/g, '')));
+    if (url && !links.includes(url)) links.push(url);
+  }
+
+  if (!text && links.length) text = links.join('\n');
+  return { text, htmlBody, links };
+}
+
+function normalizeGeneratorColumns($, root) {
+  let senders = root.find('.from_div_45g45gg').toArray();
+  let subjects = root.find('.subj_div_45g45gg').toArray();
+  let bodies = root.find('.mess_bodiyy').toArray();
+
+  // Generator.email يضع أحياناً خلايا العناوين From / Subject داخل نفس الكلاسات.
+  // نزيلها من بداية الأعمدة قبل الربط حتى لا تنزاح الرسالة الحقيقية عن جسمها.
+  while (senders.length) {
+    const v = $(senders[0]).text().replace(/\s+/g, ' ').trim().toLowerCase();
+    if (['from', 'المرسل', 'من'].includes(v)) senders.shift(); else break;
+  }
+  while (subjects.length) {
+    const v = $(subjects[0]).text().replace(/\s+/g, ' ').trim().toLowerCase();
+    if (['subject', 'العنوان', 'الموضوع'].includes(v)) subjects.shift(); else break;
+  }
+
+  // أبقِ فقط أجسام الرسائل التي تحتوي شيئاً حقيقياً.
+  bodies = bodies.filter((node) => {
+    const data = getFullMessageLikePython($, node);
+    return Boolean(data.text || data.htmlBody || data.links.length);
+  });
+
+  return { senders, subjects, bodies };
+}
+
 function parseMailbox(html, email) {
   const $ = cheerio.load(String(html || ''));
   const table = $('#email-table');
-  const root = table.length ? table : $.root();
+  if (!table.length) return [];
 
-  const senderNodes = root.find('.from_div_45g45gg').toArray()
-    .filter((node) => {
-      const text = cleanHeaderLikeText($(node).text(), ['From', 'المرسل', 'من']);
-      return Boolean(text && /@/.test(text));
-    });
-
-  const subjectNodes = root.find('.subj_div_45g45gg').toArray()
-    .filter((node) => Boolean(cleanHeaderLikeText($(node).text(), ['Subject', 'العنوان', 'الموضوع'])));
-
-  const bodyNodes = root.find('.mess_bodiyy').toArray()
-    .filter((node) => {
-      const probe = extractBodyFromNode($, node);
-      return Boolean(probe.text || probe.htmlBody || probe.links.length);
-    });
-
+  // نستخدم نفس الأعمدة الموجودة في كود Python المرسل من المستخدم.
+  const { senders, subjects, bodies } = normalizeGeneratorColumns($, table);
   const messages = [];
-  const count = Math.max(senderNodes.length, subjectNodes.length, bodyNodes.length);
+  const count = Math.max(senders.length, subjects.length, bodies.length);
 
   for (let i = 0; i < count; i += 1) {
-    const bodyNode = bodyNodes[i] || null;
+    const senderRaw = senders[i] ? $(senders[i]).text().replace(/\s+/g, ' ').trim() : '';
+    const subjectRaw = subjects[i] ? $(subjects[i]).text().replace(/\s+/g, ' ').trim() : '';
+    const bodyData = getFullMessageLikePython($, bodies[i] || null);
 
-    let container = bodyNode ? $(bodyNode) : (senderNodes[i] ? $(senderNodes[i]) : (subjectNodes[i] ? $(subjectNodes[i]) : null));
+    let senderText = senderRaw || 'غير معروف';
+    let subject = subjectRaw || 'بدون عنوان';
+    let text = bodyData.text;
+    const htmlBody = bodyData.htmlBody;
+    const links = [...bodyData.links];
+
+    // إذا كانت بنية الصفحة مختلفة قليلاً، نقرأ بيانات To/From/Subject/Received من أقرب حاوية.
+    const anchorNode = bodies[i] || senders[i] || subjects[i] || null;
+    let container = anchorNode ? $(anchorNode) : null;
     if (container?.length) {
+      // اصعد حتى حاوية صغيرة تحتوي بيانات الرسالة ولا تبتلع كل جدول البريد.
       let cursor = container;
-      for (let depth = 0; depth < 7; depth += 1) {
-        const senderInside = cursor.find('.from_div_45g45gg').toArray()
-          .map((n) => cleanHeaderLikeText($(n).text(), ['From', 'المرسل', 'من']))
-          .find((t) => t && /@/.test(t));
-        if (senderInside) {
+      for (let depth = 0; depth < 6 && cursor.length; depth += 1) {
+        const t = cursor.text().replace(/\s+/g, ' ').trim();
+        if (/\bTo:\s*/i.test(t) || (/\bFrom\b/i.test(t) && /\bSubject\b/i.test(t))) {
           container = cursor;
           break;
         }
         cursor = cursor.parent();
-        if (!cursor.length) break;
       }
     }
-
-    const senderFromContainer = container?.length
-      ? container.find('.from_div_45g45gg').toArray()
-          .map((n) => cleanHeaderLikeText($(n).text(), ['From', 'المرسل', 'من']))
-          .find((t) => t && /@/.test(t))
-      : '';
-
-    const subjectFromContainer = container?.length
-      ? container.find('.subj_div_45g45gg').toArray()
-          .map((n) => cleanHeaderLikeText($(n).text(), ['Subject', 'العنوان', 'الموضوع']))
-          .find(Boolean)
-      : '';
-
-    let senderText = senderFromContainer
-      || (senderNodes[i] ? cleanHeaderLikeText($(senderNodes[i]).text(), ['From', 'المرسل', 'من']) : '')
-      || 'غير معروف';
-
-    let subject = subjectFromContainer
-      || (subjectNodes[i] ? cleanHeaderLikeText($(subjectNodes[i]).text(), ['Subject', 'العنوان', 'الموضوع']) : '')
-      || 'بدون عنوان';
-
-    const bodyData = extractBodyFromNode($, bodyNode);
-    let text = bodyData.text;
-    const htmlBody = bodyData.htmlBody;
-    const links = [...bodyData.links];
 
     const containerText = container?.length ? container.text().replace(/\s+/g, ' ').trim() : '';
     const containerHtml = container?.length ? (container.html() || '') : '';
 
     const toMatch = containerText.match(/\bTo:\s*([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})/i);
-    const fromMatch = containerText.match(/\bFrom:\s*([^]*?)(?=\s+(?:Subject:|Received:|To:)|$)/i);
-    const subjectMatch = containerText.match(/\bSubject:\s*([^]*?)(?=\s+(?:Received:|To:|From:)|$)/i);
-    const receivedMatch = containerText.match(/\bReceived:\s*([0-9]{4}[-\/][0-9]{1,2}[-\/][0-9]{1,2}\s+[0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?)/i);
+    const fromMatch = containerText.match(/\bFrom:\s*(.*?)(?=\s+(?:Subject:|Time:|Received:|To:|Delete Message|View source)|$)/i);
+    const subjectMatch = containerText.match(/\bSubject:\s*(.*?)(?=\s+(?:Time:|Received:|To:|From:|Delete Message|View source)|$)/i);
+    const receivedMatch = containerText.match(/(?:\bReceived:|\bTime:)\s*(20\d{2}[-\/]\d{1,2}[-\/]\d{1,2}\s+\d{1,2}:\d{2}(?::\d{2})?)/i);
 
-    if ((!senderText || senderText === 'غير معروف') && fromMatch?.[1]) senderText = fromMatch[1].trim();
-    if ((!subject || subject === 'بدون عنوان') && subjectMatch?.[1]) subject = subjectMatch[1].trim();
+    if ((!senderRaw || /^from$/i.test(senderRaw)) && fromMatch?.[1]) senderText = fromMatch[1].trim();
+    if ((!subjectRaw || /^subject$/i.test(subjectRaw)) && subjectMatch?.[1]) subject = subjectMatch[1].trim();
 
+    // لو body div لم يحتوِ النص كاملًا، استخرج النص من الحاوية مع حذف حقول التحكم.
     if (!text && containerText) {
-      let fallback = containerText;
-      fallback = fallback
-        .replace(/\bTo:\s*[^\s]+/i, '')
-        .replace(/\bFrom:\s*.*?(?=\s+Subject:|\s+Received:|$)/i, '')
-        .replace(/\bSubject:\s*.*?(?=\s+Received:|$)/i, '')
-        .replace(/\bReceived:\s*[0-9]{4}[-\/][0-9]{1,2}[-\/][0-9]{1,2}\s+[0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?/i, '')
+      let fallback = containerText
+        .replace(/\bTo:\s*[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/ig, '')
+        .replace(/\bFrom:\s*.*?(?=\s+Subject:|\s+Time:|\s+Received:|\s+To:|$)/ig, '')
+        .replace(/\bSubject:\s*.*?(?=\s+Time:|\s+Received:|\s+To:|\s+From:|$)/ig, '')
+        .replace(/(?:\bReceived:|\bTime:)\s*20\d{2}[-\/]\d{1,2}[-\/]\d{1,2}\s+\d{1,2}:\d{2}(?::\d{2})?/ig, '')
         .replace(/\b(Delete Message|View source|From|Subject|Time(?:\s*\(UTC\))?)\b/gi, '')
         .replace(/\s+/g, ' ')
         .trim();
       if (fallback) text = fallback;
     }
 
-    const allUrls = `${text}\n${containerHtml}`.match(/https?:\/\/[^\s<>'"]+/gi) || [];
+    const allUrls = `${text}\n${htmlBody}\n${containerHtml}`.match(/https?:\/\/[^\s<>'"]+/gi) || [];
     for (const raw of allUrls) {
-      const url = normalizeUrl(raw.replace(/[),.;"'<>]+$/g, ''));
+      const url = normalizeUrl(decodeBasicEntities(raw.replace(/[),.;"'<>]+$/g, '')));
       if (url && !links.includes(url)) links.push(url);
     }
     if (!text && links.length) text = links.join('\n');
 
-    const sender = parseSender(senderText);
+    const normalizedSender = String(senderText || '').trim();
+    const normalizedSubject = String(subject || '').trim();
+
+    // لا نرسل صف عناوين الجدول كأنه رسالة.
+    if (/^from$/i.test(normalizedSender) && /^subject$/i.test(normalizedSubject) && !text && !links.length) continue;
+    if (!normalizedSender && !normalizedSubject && !text && !links.length) continue;
+
+    const sender = parseSender(normalizedSender || 'غير معروف');
     const createdAt = receivedMatch?.[1]
       ? (extractTimestamp(receivedMatch[1]) || new Date().toISOString())
-      : (extractTimestamp(containerText) || new Date(Date.now() - i * 1000).toISOString());
+      : (extractTimestamp(containerText) || '');
+    const codes = extractCodes(`${normalizedSubject}\n${text}\n${links.join('\n')}`);
+    const toAddress = normalizeAddress(toMatch?.[1] || email);
 
-    const codes = extractCodes(`${subject}\n${text}\n${links.join('\n')}`);
-    const toAddress = toMatch?.[1] || email;
+    // استخدم بصمة مستقرة لا تعتمد على وقت الفحص حتى لا تتكرر الرسالة كل دورة.
+    const idSeed = [
+      sender.address || sender.name || normalizedSender,
+      normalizedSubject,
+      receivedMatch?.[1] || '',
+      text,
+      links.join('|')
+    ].join('|');
 
     messages.push({
-      id: stableId(sender.address || sender.name || senderText, subject, `${receivedMatch?.[1] || ''}|${text || htmlBody}|${links.join('|')}`),
-      to: toAddress,
+      id: 'gen-' + crypto.createHash('sha1').update(idSeed).digest('hex').slice(0, 24),
+      to: toAddress || normalizeAddress(email),
       from: sender,
-      subject,
-      intro: text.slice(0, 220),
+      subject: normalizedSubject || 'بدون عنوان',
+      intro: text.slice(0, 300),
       text,
       html: htmlBody,
-      createdAt,
-      receivedAt: createdAt,
+      createdAt: createdAt || '',
+      receivedAt: createdAt || '',
       seen: false,
       verifications: codes,
       codes,
@@ -267,72 +336,116 @@ function parseMailbox(html, email) {
     });
   }
 
-  return [...new Map(
-    messages
-      .filter((message) => {
-        const from = String(message?.from?.address || message?.from?.name || '').trim().toLowerCase();
-        const subject = String(message?.subject || '').trim().toLowerCase();
-        return from !== 'from' && subject !== 'subject';
-      })
-      .map((message) => [message.id, message])
-  ).values()];
+  // الأحدث أولاً كما يظهر في Generator.email.
+  return [...new Map(messages.map((message) => [message.id, message])).values()];
+}
+
+function storeSetCookies(jar, setCookieHeaders = []) {
+  const values = Array.isArray(setCookieHeaders) ? setCookieHeaders : [setCookieHeaders].filter(Boolean);
+  for (const line of values) {
+    const pair = String(line || '').split(';', 1)[0];
+    const eq = pair.indexOf('=');
+    if (eq <= 0) continue;
+    const name = pair.slice(0, eq).trim();
+    const value = pair.slice(eq + 1).trim();
+    if (name) jar.set(name, value);
+  }
+}
+
+function cookieHeader(jar) {
+  return Array.from(jar.entries()).map(([name, value]) => `${name}=${value}`).join('; ');
+}
+
+async function requestGeneratorWithCookies(url, jar, baseHeaders) {
+  let current = url;
+  for (let hop = 0; hop < 10; hop += 1) {
+    const cookies = cookieHeader(jar);
+    const response = await axios.get(current, {
+      headers: { ...baseHeaders, ...(cookies ? { Cookie: cookies } : {}) },
+      timeout: 20000,
+      responseType: 'text',
+      maxRedirects: 0,
+      validateStatus: (status) => status >= 200 && status < 400
+    });
+
+    storeSetCookies(jar, response.headers?.['set-cookie']);
+
+    if (response.status >= 300 && response.status < 400 && response.headers?.location) {
+      current = new URL(response.headers.location, current).toString();
+      continue;
+    }
+
+    return {
+      html: String(response.data || ''),
+      finalUrl: current,
+      status: response.status
+    };
+  }
+  throw new Error('Generator.email أعاد تحويلات كثيرة جداً أثناء فتح الصندوق.');
 }
 
 async function fetchMailboxHtml(email) {
   const address = normalizeAddress(email);
   const [username, domain] = address.split('@');
-
-  // مهم: هذا هو نفس الرابط وطريقة الطلب في كود Python الذي يعمل مع Generator.email:
-  // https://generator.email/5xu.vn/username
-  // لا نضيف query string ولا نطلب API وهمي ولا نشترط ظهور الإيميل كنص داخل الصفحة.
-  const targets = [
-    `${GENERATOR_BASE}/${domain}/${username}`,
-    `${GENERATOR_BASE}/inbox9/${address}`
-  ];
+  const inboxUrl = `${GENERATOR_BASE}/inbox9/${address}`;
+  const bootstrapUrl = `${GENERATOR_BASE}/${domain}/${username}`;
 
   const headers = {
-    // نفس الـ User-Agent الموجود في كود Python فقط.
+    // نفس User-Agent الذي في كود Python الذي أثبت أنه يعمل.
     'User-Agent': 'Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 Chrome/136.0 Mobile Safari/537.36',
-    'Accept': '*/*'
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Cache-Control': 'no-cache',
+    'Pragma': 'no-cache'
   };
 
+  // requests في Python يحتفظ بالكوكيز أثناء التحويلات تلقائياً.
+  // Axios لا يفعل ذلك بنفس الصورة، لذلك نطبّق jar صغيراً يدوياً ثم نفتح inbox9 نفسه.
+  const jar = new Map();
+  const candidates = [];
   let lastError = null;
-  let lastHtml = '';
 
-  for (const target of targets) {
-    try {
-      const response = await axios.get(target, {
-        headers,
-        timeout: 20000,
-        responseType: 'text',
-        maxRedirects: 8,
-        validateStatus: (status) => status >= 200 && status < 400
-      });
-
-      const html = String(response.data || '');
-      lastHtml = html;
-
-      // نفس BeautifulSoup: soup.find("div", id="email-table")
-      const $ = cheerio.load(html);
-      if ($('#email-table').length) {
-        return { html, source: target, finalUrl: response.request?.res?.responseUrl || target };
-      }
-
-      lastError = new Error(`Generator.email لم يعرض جدول الرسائل في ${target}`);
-    } catch (error) {
-      lastError = error;
-    }
+  try {
+    const boot = await requestGeneratorWithCookies(bootstrapUrl, jar, headers);
+    if (boot.html) candidates.push({ ...boot, source: bootstrapUrl, kind: 'bootstrap' });
+  } catch (error) {
+    lastError = error;
   }
 
-  // إذا رجعت صفحة HTML بلا جدول، لا نصفها كصندوق مختلف؛ نعطي خطأ واضح ليسهل التشخيص.
-  if (lastHtml) {
-    const error = new Error('Generator.email رد بصفحة، لكن جدول الرسائل email-table غير موجود فيها حالياً.');
+  try {
+    // هذا هو الرابط الذي طلبه المستخدم حرفياً؛ يتم فتحه على السيرفر وبنفس جلسة الكوكيز.
+    const inbox = await requestGeneratorWithCookies(inboxUrl, jar, {
+      ...headers,
+      Referer: bootstrapUrl
+    });
+    if (inbox.html) candidates.push({ ...inbox, source: inboxUrl, kind: 'inbox9' });
+  } catch (error) {
+    lastError = error;
+  }
+
+  // اختر النسخة التي تحتوي أكبر عدد رسائل حقيقية. عند التعادل نفضّل inbox9.
+  let best = null;
+  for (const candidate of candidates) {
+    const $ = cheerio.load(candidate.html);
+    if (!$('#email-table').length) continue;
+    const count = parseMailbox(candidate.html, address).length;
+    const score = count * 100 + (candidate.kind === 'inbox9' ? 10 : 0);
+    if (!best || score > best.score) best = { ...candidate, score, count };
+  }
+
+  if (best) {
+    return { html: best.html, source: inboxUrl, finalUrl: best.finalUrl, messageCount: best.count };
+  }
+
+  if (candidates.length) {
+    const error = new Error('تم فتح Generator.email لكن لم يظهر جدول email-table في المصدر الذي أعاده السيرفر.');
     error.statusCode = 502;
     throw error;
   }
 
-  throw lastError || new Error('تعذر قراءة صندوق البريد من Generator.email.');
+  throw lastError || new Error('تعذر فتح صندوق البريد من Generator.email.');
 }
+
 async function getMailbox(email) {
   const address = normalizeAddress(email);
   if (!isAllowedEmail(address)) {
@@ -340,10 +453,11 @@ async function getMailbox(email) {
     error.statusCode = 400;
     throw error;
   }
-  const { html, source } = await fetchMailboxHtml(address);
+  const { html, source, finalUrl } = await fetchMailboxHtml(address);
   return {
     email: address,
     source,
+    finalUrl,
     messages: parseMailbox(html, address)
   };
 }
@@ -353,7 +467,7 @@ async function getMailbox(email) {
 // =========================
 
 const EMAIL_LIFETIME_MS = 6 * 24 * 60 * 60 * 1000;
-const AUTO_CHECK_INTERVAL_MS = Math.max(5000, Number(process.env.AUTO_CHECK_INTERVAL_MS || 5000));
+const AUTO_CHECK_INTERVAL_MS = Math.max(3000, Number(process.env.AUTO_CHECK_INTERVAL_MS || 3000));
 const DEFAULT_PINS = ['1212', '1001', '2121', '2026', '2002'];
 
 function randomGeneratorUsername() {
@@ -1105,6 +1219,7 @@ app.get('/health', (_req, res) => {
   res.json({
     ok: true,
     service: 'generator-email-railway-web-telegram',
+    mailReader: MAIL_READER_BUILD,
     telegram: {
       configured: Boolean(TELEGRAM_BOT_TOKEN),
       status: telegramStatus,
