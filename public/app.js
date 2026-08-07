@@ -1,4 +1,4 @@
-const APP_BUILD = "2026-08-08-auto-inbox-v4";
+const APP_BUILD = "2026-08-08-fast-smart-links-v6";
 'use strict';
 
 /* تطبيق ثابت بالكامل: جميع البيانات تحفظ داخل LocalStorage فقط. */
@@ -444,6 +444,36 @@ function uniqueMessageLinks(links = []) {
   return out;
 }
 
+function isStaticAssetLinkForDisplay(value = '') {
+  const normalized = normalizeExtractedUrl(value);
+  if (!normalized) return true;
+  try {
+    const u = new URL(normalized);
+    const host = u.hostname.toLowerCase();
+    if (host === 'beaconimages.netflix.net' || host === 'assets.nflxext.com') return true;
+    return /\.(?:png|jpe?g|gif|webp|svg|ico|css|js|woff2?|ttf|eot)$/i.test(u.pathname);
+  } catch (_) { return true; }
+}
+
+function importantLinksForMessage(message) {
+  const provided = uniqueMessageLinks(message?.importantLinks || []).filter((url) => !isStaticAssetLinkForDisplay(url));
+  if (provided.length) return provided.slice(0, 3);
+  const all = uniqueMessageLinks(message?.links || []).filter((url) => !isStaticAssetLinkForDisplay(url));
+  const ranked = all.filter((url) => /(?:verify|confirm|activate|complete|signup|register|create.?account|reset.?password|login|signin|\/epr(?:\?|$)|[?&](?:code|token|otp)=)/i.test(url));
+  return (ranked.length ? ranked : all.filter((url) => !/(?:privacy|terms|contactus|\/help(?:\/|\?|$)|unsubscribe|url_(?:logo|help|privacy|terms|src|email))/i.test(url))).slice(0, 2);
+}
+
+function compactLiveMessageText(text = '', maxLength = 500) {
+  let value = String(text || '')
+    .replace(/https?:\/\/[^\s<>\"']+/gi, ' ')
+    .replace(/[\u00AD\u034F\u061C\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFE00-\uFE0F\uFEFF]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const footer = value.search(/(?:هل توجد لديك أسئلة|مركز خدمة العملاء|بنود الاستخدام|الخصوصية|privacy policy|terms of use|customer service|unsubscribe)/i);
+  if (footer > 60) value = value.slice(0, footer).trim();
+  return value.length > maxLength ? `${value.slice(0, maxLength).trim()}…` : value;
+}
+
 function dedupeUrlsForDisplay(text = '') {
   const seen = new Set();
   const lines = String(text || '').split(/\r?\n/);
@@ -470,9 +500,10 @@ function renderLiveMessagePreview(email, message) {
   const senderName = message?.from?.name || '';
   const senderAddress = message?.from?.address || '';
   const sender = senderAddress || senderName || 'مرسل غير معروف';
-  const body = dedupeUrlsForDisplay(String(message?.text || message?.intro || '').trim());
   const codes = Array.isArray(message?.codes) ? message.codes : [];
-  const links = uniqueMessageLinks(message?.links);
+  const importantLinks = importantLinksForMessage(message);
+  const allLinks = uniqueMessageLinks(message?.links).filter((url) => !isStaticAssetLinkForDisplay(url));
+  const snippet = compactLiveMessageText(message?.text || message?.intro || '');
   return `
     <article class="card list-card">
       <div class="email-top">
@@ -484,11 +515,31 @@ function renderLiveMessagePreview(email, message) {
       </div>
       <p><strong>من:</strong> ${escapeHTML(sender)}</p>
       ${message?.createdAt ? `<p><strong>الوقت:</strong> ${escapeHTML(formatDate(message.createdAt))}</p>` : ''}
-      ${body ? `<div class="message-text" style="margin-top:9px">${escapeHTML(body.slice(0, 1200))}</div>` : ''}
-      ${codes.length ? `<div class="btn-row" style="margin-top:10px">${codes.slice(0,5).map((code)=>`<button class="btn primary small" data-action="copy-text" data-copy="${escapeHTML(code)}">نسخ ${escapeHTML(code)}</button>`).join('')}</div>` : ''}
-      ${links.length ? `<div class="btn-row" style="margin-top:8px">${links.slice(0,4).map((url, index)=>`<a class="btn soft small" href="${escapeHTML(url)}" target="_blank" rel="noopener noreferrer">فتح الرابط ${index+1}</a>`).join('')}</div>` : ''}
+      ${codes.length ? `<div class="btn-row" style="margin-top:10px">${codes.slice(0,5).map((code)=>`<button class="btn primary small" data-action="copy-text" data-copy="${escapeHTML(code)}">نسخ الكود ${escapeHTML(code)}</button>`).join('')}</div>` : ''}
+      ${importantLinks.length ? `<div class="btn-row" style="margin-top:8px">${importantLinks.slice(0,2).map((url)=>`<a class="btn primary small" href="${escapeHTML(url)}" target="_blank" rel="noopener noreferrer">فتح الرابط المهم</a>`).join('')}</div>` : ''}
+      ${!codes.length && !importantLinks.length && snippet ? `<div class="message-text" style="margin-top:9px">${escapeHTML(snippet)}</div>` : ''}
+      ${allLinks.length ? `<button class="btn soft small wide" style="margin-top:9px" data-action="show-all-message-links" data-email-id="${escapeHTML(email.localId)}" data-message-id="${escapeHTML(message.id)}">جلب كل الروابط</button>` : ''}
     </article>
   `;
+}
+
+async function showAllLiveMessageLinks(emailId, messageId) {
+  const email = getEmail(emailId);
+  if (!email) throw new Error('الإيميل غير موجود.');
+  let message = liveMessagesForEmail(emailId).find((item) => item.id === messageId)
+    || ui.inboxMessages.find((item) => item.id === messageId);
+  if (!message) {
+    const messages = await fetchGeneratorMessages(email, { retryEmpty: false });
+    message = messages.find((item) => item.id === messageId) || messages[0];
+  }
+  if (!message) throw new Error('لم يتم العثور على الرسالة حالياً.');
+  const links = uniqueMessageLinks(message.links).filter((url) => !isStaticAssetLinkForDisplay(url));
+  openModal(`
+    <h2>كل الروابط</h2>
+    <p class="helper" dir="ltr">${escapeHTML(email.address)}</p>
+    ${links.length ? renderFetchedLinks(links) : '<div class="notice">لا توجد روابط قابلة للفتح داخل الرسالة.</div>'}
+    <button class="btn ghost wide" style="margin-top:12px" data-action="close-modal">إغلاق</button>
+  `);
 }
 
 function renderAutomaticMessagesSection(activeEmails) {
@@ -1930,7 +1981,7 @@ function stopPolling(showToast = true) {
 // لا تحتاج الضغط على «رسائل» أو «تحديث». عندما تكون الصفحة مفتوحة
 // يفحص الموقع جميع الإيميلات النشطة ويُحدّث الصندوق فور وصول رسالة جديدة.
 // =========================
-const WEBSITE_AUTO_CHECK_MS = 3000;
+const WEBSITE_AUTO_CHECK_MS = 1500;
 let websiteAutoMonitorTimer = null;
 let websiteAutoMonitorBusy = false;
 
@@ -2632,6 +2683,7 @@ async function handleClick(event) {
         // التحديث يعيد قراءة نفس الصندوق بالخلفية فقط.
         await fetchLatestCode(target.dataset.emailId);
         break;
+      case 'show-all-message-links': await showAllLiveMessageLinks(target.dataset.emailId, target.dataset.messageId); break;
       case 'open-inbox': await openInbox(target.dataset.emailId); break;
       case 'refresh-messages': await refreshInbox(); break;
       case 'set-inbox-filter': ui.inboxFilter=target.dataset.filter; renderInboxSheet(); break;
