@@ -2,11 +2,14 @@
 
 /* تطبيق ثابت بالكامل: جميع البيانات تحفظ داخل LocalStorage فقط. */
 const STORAGE_KEY = 'cd-mail-profile-manager-v1';
+const GENERATOR_DOMAIN = '5xu.vn';
+const GENERATOR_BASE = 'https://generator.email';
+const GENERATOR_CORS_PROXY = 'https://corsproxy.io/?url=';
+// تبقى هذه المزودات فقط لفتح الحسابات القديمة المحفوظة سابقاً.
 const MAIL_PROVIDERS = [
   { id: 'mailtm', name: 'Mail.tm', apiBase: 'https://api.mail.tm' },
   { id: 'mailgw', name: 'Mail.gw', apiBase: 'https://api.mail.gw' }
 ];
-const LEGACY_UNRELIABLE_DOMAINS = new Set(['web-library.net', 'deltajohnsons.com']);
 const DEFAULT_PINS = ['1212', '1001', '2121', '2026', '2002'];
 const DEFAULT_COLORS = ['#0A84FF', '#FFD60A', '#FF3B30', '#00677A', '#30D18A'];
 const READY_ICONS = ['face', 'star', 'crown', 'heart', 'bolt'];
@@ -109,14 +112,23 @@ function normalizeState(raw) {
       const old = profiles.find((item) => Number(item.number) === number) || {};
       return { ...createDefaultProfile(number), ...old, number };
     });
+    const address = email.address || '';
+    const domain = String(address).split('@').pop().trim().toLowerCase();
+    let provider = email.provider;
+    if (!['generator', 'mailtm', 'mailgw', 'local'].includes(provider)) {
+      provider = domain === GENERATOR_DOMAIN ? 'generator' : ((email.token || email.password) ? 'mailtm' : 'local');
+    }
     return {
       localId: email.localId || makeId(),
       mailTmId: email.mailTmId || email.id || '',
-      address: email.address || '',
+      address,
       password: email.password || '',
       token: email.token || '',
-      provider: email.provider === 'local' ? 'local' : (email.provider === 'mailgw' ? 'mailgw' : 'mailtm'),
-      apiBase: email.apiBase || (email.provider === 'mailgw' ? 'https://api.mail.gw' : email.provider === 'local' ? '' : 'https://api.mail.tm'),
+      provider,
+      apiBase: email.apiBase || (provider === 'mailgw' ? 'https://api.mail.gw' : provider === 'mailtm' ? 'https://api.mail.tm' : ''),
+      generatorDomain: email.generatorDomain || (provider === 'generator' ? (domain || GENERATOR_DOMAIN) : ''),
+      generatorSeenIds: Array.isArray(email.generatorSeenIds) ? email.generatorSeenIds : [],
+      generatorDeletedIds: Array.isArray(email.generatorDeletedIds) ? email.generatorDeletedIds : [],
       localName: email.localName || '',
       createdAt: email.createdAt || new Date().toISOString(),
       status: ['active', 'archived', 'completed'].includes(email.status) ? email.status : 'active',
@@ -197,17 +209,27 @@ function emailStatusLabel(status) {
   return status === 'completed' ? 'مكتمل' : status === 'archived' ? 'مؤرشف' : 'نشط';
 }
 
+function isGeneratorEmail(email) {
+  return email?.provider === 'generator' || (!email?.provider && emailDomain(email?.address) === GENERATOR_DOMAIN);
+}
+
 function isMailTmEmail(email) {
-  return email?.provider !== 'local';
+  return email?.provider === 'mailtm' || email?.provider === 'mailgw';
+}
+
+function hasRemoteInbox(email) {
+  return isGeneratorEmail(email) || isMailTmEmail(email);
 }
 
 function emailProviderLabel(email) {
-  if (!isMailTmEmail(email)) return 'إيميل عادي';
-  return email?.provider === 'mailgw' ? 'Mail.gw' : 'Mail.tm';
+  if (isGeneratorEmail(email)) return 'Generator.email';
+  if (email?.provider === 'mailgw') return 'Mail.gw';
+  if (email?.provider === 'mailtm') return 'Mail.tm';
+  return 'إيميل عادي';
 }
 
 function getEmailApiBase(email) {
-  if (!email || email.provider === 'local') return '';
+  if (!isMailTmEmail(email)) return '';
   return email.apiBase || (email.provider === 'mailgw' ? 'https://api.mail.gw' : 'https://api.mail.tm');
 }
 
@@ -467,7 +489,7 @@ function renderEmailDetail() {
   }
   state.lastEmailId = email.localId;
   saveState({ silent: true });
-  const mailTm = isMailTmEmail(email);
+  const remoteInbox = hasRemoteInbox(email);
   const soldMode = email.status === 'completed' || ui.returnView === 'sold-emails';
   const shownProfiles = soldMode ? email.profiles : email.profiles.filter((p) => p.status !== 'sold');
 
@@ -483,7 +505,7 @@ function renderEmailDetail() {
         <button class="btn primary" data-action="fetch-code" data-email-id="${email.localId}">جلب الكود والروابط</button>
         <button class="btn ghost" data-action="change-profile-icons" data-email-id="${email.localId}">تغيير الرموز</button>
       </div>
-      ${!mailTm ? '<p class="helper simple-note">هذا الإيميل مضاف للتنظيم فقط، لذلك جلب الكود والروابط يحتاج حساباً تم إنشاؤه تلقائياً من Mail.tm.</p>' : ''}
+      ${!remoteInbox ? '<p class="helper simple-note">هذا الإيميل مضاف للتنظيم فقط. جلب الرسائل يعمل مع الإيميلات المنشأة تلقائياً من Generator.email.</p>' : ''}
     </section>
 
     <section class="section">
@@ -557,7 +579,7 @@ function renderArchive() {
     </section>
 
     <section class="section">
-      <div class="section-head"><div><h2>الإيميلات المؤرشفة</h2><p>يمكن استرجاعها أو حذفها محلياً أو نهائياً من Mail.tm</p></div></div>
+      <div class="section-head"><div><h2>الإيميلات المؤرشفة</h2><p>يمكن استرجاعها أو حذفها محلياً</p></div></div>
       <div class="archive-list">
         ${archivedEmails.length ? archivedEmails.map((email) => `
           <article class="card list-card"><h3>${escapeHTML(email.localName || email.address)}</h3><p>${escapeHTML(email.address)}</p><p>تاريخ الإنشاء: ${formatDate(email.createdAt)} · تاريخ الأرشفة: ${formatDate(email.archivedAt)}</p>
@@ -567,11 +589,11 @@ function renderArchive() {
     </section>
 
     <section class="section">
-      <div class="section-head"><div><h2>الرسائل المؤرشفة محلياً</h2><p>الأرشفة هنا لا تحذف الرسالة من Mail.tm</p></div></div>
+      <div class="section-head"><div><h2>الرسائل المؤرشفة محلياً</h2><p>الأرشفة هنا محلية داخل هذا المتصفح</p></div></div>
       <div class="archive-list">
         ${archivedMessages.length ? archivedMessages.map((message) => `
           <article class="card list-card"><h3>${escapeHTML(message.subject || 'بدون عنوان')}</h3><p>${escapeHTML(message.fromName || message.fromAddress || 'مرسل غير معروف')} · ${formatDate(message.createdAt)}</p><p>${escapeHTML(message.emailAddress || '')}</p>
-          <div class="btn-row"><button class="btn soft small" data-action="view-archived-message" data-archive-id="${message.id}">عرض</button><button class="btn success small" data-action="restore-archived-message" data-archive-id="${message.id}">استرجاع</button><button class="btn danger small" data-action="delete-archived-message" data-archive-id="${message.id}">حذف محلي</button><button class="btn danger small" data-action="delete-archived-message-remote" data-archive-id="${message.id}">حذف نهائي من Mail.tm</button></div></article>
+          <div class="btn-row"><button class="btn soft small" data-action="view-archived-message" data-archive-id="${message.id}">عرض</button><button class="btn success small" data-action="restore-archived-message" data-archive-id="${message.id}">استرجاع</button><button class="btn danger small" data-action="delete-archived-message" data-archive-id="${message.id}">حذف محلي</button></div></article>
         `).join('') : emptyState('🗂️', 'لا توجد رسائل مؤرشفة', 'يمكنك أرشفة أي رسالة من صندوق الوارد.')}
       </div>
     </section>
@@ -615,7 +637,7 @@ function renderSettings() {
 
     <section class="section" style="margin-top:18px">
       <div class="card settings-list">
-        <button class="setting-row" data-action="api-info" style="width:100%;border:0;color:inherit;text-align:right;cursor:pointer"><div class="setting-label"><span class="setting-icon">API</span><div><b>معلومات API</b><small>طريقة الاتصال بخدمة Mail.tm</small></div></div><span>‹</span></button>
+        <button class="setting-row" data-action="api-info" style="width:100%;border:0;color:inherit;text-align:right;cursor:pointer"><div class="setting-label"><span class="setting-icon">API</span><div><b>معلومات API</b><small>طريقة الاتصال بخدمة Generator.email</small></div></div><span>‹</span></button>
         <button class="setting-row" data-action="about-app" style="width:100%;border:0;color:inherit;text-align:right;cursor:pointer"><div class="setting-label"><span class="setting-icon">i</span><div><b>حول الموقع</b><small>نسخة محلية ثابتة بدون Backend</small></div></div><span>‹</span></button>
       </div>
     </section>
@@ -1039,7 +1061,21 @@ function randomUsername() {
   return `cd${random}`;
 }
 
-function buildEmailRecord({ mailTmId, address, password, token, provider = 'mailtm', apiBase = '', createdAt = new Date().toISOString() }) {
+function randomGeneratorUsername() {
+  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  for (let tries = 0; tries < 50; tries += 1) {
+    const lengthBytes = new Uint32Array(1);
+    crypto.getRandomValues(lengthBytes);
+    const length = 5 + (lengthBytes[0] % 2); // 5 أو 6 أحرف فقط
+    const bytes = new Uint32Array(length);
+    crypto.getRandomValues(bytes);
+    const value = Array.from(bytes, (n) => chars[n % chars.length]).join('');
+    if (/[a-z]/.test(value) && /\d/.test(value)) return value;
+  }
+  return `a${String(Date.now()).slice(-4)}`;
+}
+
+function buildEmailRecord({ mailTmId, address, password, token, provider = 'generator', apiBase = '', createdAt = new Date().toISOString() }) {
   const profiles = [1,2,3,4,5].map(createDefaultProfile);
   if (state.globalProfileStyles) {
     profiles.forEach((profile) => {
@@ -1049,7 +1085,9 @@ function buildEmailRecord({ mailTmId, address, password, token, provider = 'mail
   }
   return {
     localId: makeId(), mailTmId: mailTmId || '', address, password: password || '', token: token || '', provider,
-    apiBase: apiBase || (provider === 'mailgw' ? 'https://api.mail.gw' : provider === 'local' ? '' : 'https://api.mail.tm'),
+    apiBase: apiBase || (provider === 'mailgw' ? 'https://api.mail.gw' : provider === 'mailtm' ? 'https://api.mail.tm' : ''),
+    generatorDomain: provider === 'generator' ? (emailDomain(address) || GENERATOR_DOMAIN) : '',
+    generatorSeenIds: [], generatorDeletedIds: [],
     localName: '', createdAt, status: 'active', archivedAt: null, completedAt: null,
     archivedMessageIds: [], profiles
   };
@@ -1102,77 +1140,35 @@ async function createMailAccount() {
   setBusy('create-email', true);
   renderHome();
   try {
-    let createdAccount = null;
-    let selectedProvider = null;
-    let password = '';
     let address = '';
-    let lastError = null;
-
-    for (const provider of MAIL_PROVIDERS) {
-      let domains = [];
-      try {
-        domains = await getProviderDomains(provider);
-      } catch (error) {
-        lastError = error;
-        continue;
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      const candidate = `${randomGeneratorUsername()}@${GENERATOR_DOMAIN}`;
+      if (!state.emails.some((email) => email.address.toLowerCase() === candidate.toLowerCase())) {
+        address = candidate;
+        break;
       }
-      if (!domains.length) continue;
-
-      for (const domain of domains.slice(0, 8)) {
-        for (let attempt = 0; attempt < 6; attempt += 1) {
-          password = randomPassword();
-          address = `${randomUsername()}@${domain}`;
-          if (state.emails.some((email) => email.address.toLowerCase() === address.toLowerCase())) continue;
-          try {
-            const result = await fetchJson(`${provider.apiBase}/accounts`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json', 'Accept': 'application/ld+json, application/json' },
-              body: JSON.stringify({ address, password })
-            });
-            createdAccount = result.data;
-            selectedProvider = provider;
-            break;
-          } catch (error) {
-            lastError = error;
-            if ([404, 422].includes(error.status)) continue;
-            break;
-          }
-        }
-        if (createdAccount) break;
-      }
-      if (createdAccount) break;
     }
+    if (!address) throw new Error('تعذر إنشاء اسم إيميل فريد. حاول مرة أخرى.');
 
-    if (!createdAccount || !selectedProvider) {
-      throw new Error(lastError?.message || 'تعذر إنشاء إيميل من النطاقات الفعالة حالياً. حاول مرة أخرى بعد قليل.');
-    }
-
-    const { data: tokenData } = await fetchJson(`${selectedProvider.apiBase}/token`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Accept': 'application/ld+json, application/json' },
-      body: JSON.stringify({ address, password })
-    });
-    if (!tokenData?.token) throw new Error('تم إنشاء الحساب، لكن تعذر استخراج رمز الدخول. حاول مرة أخرى.');
-
+    // Generator.email لا يحتاج إنشاء حساب أو كلمة مرور؛ أي اسم على النطاق يصبح صندوقاً قابلاً للاستقبال.
     const email = buildEmailRecord({
-      mailTmId: createdAccount.id || tokenData.id,
       address,
-      password,
-      token: tokenData.token,
-      provider: selectedProvider.id,
-      apiBase: selectedProvider.apiBase,
-      createdAt: createdAccount.createdAt || new Date().toISOString()
+      password: '',
+      token: '',
+      provider: 'generator',
+      apiBase: '',
+      createdAt: new Date().toISOString()
     });
     state.emails.unshift(email);
     state.lastEmailId = email.localId;
     if (!saveState()) return;
-    toast(`تم إنشاء الإيميل بنجاح عبر ${selectedProvider.name}.`);
+    toast('تم إنشاء الإيميل بنجاح.');
     await copyText(address, false);
     ui.selectedEmailId = email.localId;
     ui.returnView = 'home';
     ui.view = 'email-detail';
   } catch (error) {
-    toast(error.message || 'تعذر إنشاء الإيميل. تحقق من الإنترنت وحاول مرة أخرى.', 'error', 6500);
+    toast(error.message || 'تعذر إنشاء الإيميل.', 'error', 6500);
   } finally {
     setBusy('create-email', false);
     render();
@@ -1234,12 +1230,13 @@ async function saveLocalEmail() {
     return;
   }
 
+  const provider = emailDomain(address) === GENERATOR_DOMAIN ? 'generator' : 'local';
   const email = buildEmailRecord({
     address,
     password: '',
     token: '',
     mailTmId: '',
-    provider: 'local',
+    provider,
     createdAt: new Date().toISOString()
   });
   state.emails.unshift(email);
@@ -1264,6 +1261,147 @@ async function copyText(text, notify = true) {
     document.body.appendChild(area); area.select(); document.execCommand('copy'); area.remove();
   }
   if (notify) toast(text.match(/^\d{4,8}$/) ? 'تم نسخ الكود.' : 'تم النسخ بنجاح.');
+}
+
+function generatorInboxTargets(email) {
+  const address = String(email?.address || '').trim().toLowerCase();
+  const [username, domain] = address.split('@');
+  if (!username || !domain) return [];
+  return [
+    `${GENERATOR_BASE}/${encodeURIComponent(domain)}/${encodeURIComponent(username)}`,
+    `${GENERATOR_BASE}/${encodeURIComponent(address)}`,
+    `https://hy.generator.email/${encodeURIComponent(address)}`
+  ];
+}
+
+async function fetchTextWithTimeout(url, options = {}, timeoutMs = 22000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal, cache: 'no-store' });
+    if (!response.ok) throw new Error(`فشل جلب صندوق البريد (${response.status}).`);
+    return await response.text();
+  } catch (error) {
+    if (error.name === 'AbortError') throw new Error('انتهت مهلة الاتصال بخدمة البريد.');
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchGeneratorHtml(email) {
+  const targets = generatorInboxTargets(email);
+  if (!targets.length) throw new Error('عنوان الإيميل غير صالح.');
+  let lastError = null;
+
+  for (const target of targets) {
+    const freshTarget = `${target}${target.includes('?') ? '&' : '?'}_=${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const candidates = [
+      `${GENERATOR_CORS_PROXY}${encodeURIComponent(freshTarget)}`,
+      freshTarget
+    ];
+    for (const url of candidates) {
+      try {
+        const html = await fetchTextWithTimeout(url, { headers: { 'Accept': 'text/html,application/xhtml+xml' } });
+        if (html && /<html|email-table|mess_bodiyy|subj_div_45g45gg/i.test(html)) return html;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+  }
+  throw new Error(lastError?.message || 'تعذر فتح صندوق Generator.email. حاول مرة أخرى.');
+}
+
+function cleanMessageText(bodyElement) {
+  if (!bodyElement) return '';
+  const copy = bodyElement.cloneNode(true);
+  copy.querySelectorAll('a[href]').forEach((anchor) => {
+    const href = normalizeExtractedUrl(anchor.getAttribute('href') || '');
+    const title = (anchor.textContent || '').trim();
+    if (!href) return;
+    const text = document.createTextNode(`\n${title ? `${title}\n` : ''}${href}\n`);
+    anchor.replaceWith(text);
+  });
+  return (copy.textContent || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join('\n');
+}
+
+function stableGeneratorMessageId(sender, subject, body, index) {
+  const source = `${sender}|${subject}|${body}|${index}`;
+  let hash = 2166136261;
+  for (let i = 0; i < source.length; i += 1) {
+    hash ^= source.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `gen-${(hash >>> 0).toString(16)}`;
+}
+
+function parseGeneratorSender(raw = '') {
+  const text = String(raw).trim();
+  const angle = text.match(/^(.*?)\s*<([^<>\s]+@[^<>\s]+)>$/);
+  if (angle) return { name: angle[1].trim(), address: angle[2].trim() };
+  const emailMatch = text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+  return { name: emailMatch ? text.replace(emailMatch[0], '').replace(/[<>]/g, '').trim() : text, address: emailMatch?.[0] || '' };
+}
+
+function parseGeneratorMessages(html, email) {
+  const doc = new DOMParser().parseFromString(String(html || ''), 'text/html');
+  const table = doc.querySelector('#email-table');
+  if (!table) return [];
+
+  const senders = [...table.querySelectorAll('.from_div_45g45gg')];
+  const subjects = [...table.querySelectorAll('.subj_div_45g45gg')];
+  const bodies = [...table.querySelectorAll('.mess_bodiyy')];
+  const count = Math.max(senders.length, subjects.length, bodies.length);
+  const now = Date.now();
+  const deleted = new Set(email.generatorDeletedIds || []);
+  const seen = new Set(email.generatorSeenIds || []);
+  const messages = [];
+
+  for (let i = 0; i < count; i += 1) {
+    const senderText = senders[i]?.textContent?.trim() || 'غير معروف';
+    const subject = subjects[i]?.textContent?.trim() || 'بدون عنوان';
+    const bodyElement = bodies[i] || null;
+    const text = cleanMessageText(bodyElement);
+    const htmlBody = bodyElement?.innerHTML || '';
+    const id = stableGeneratorMessageId(senderText, subject, text || htmlBody, i);
+    if (deleted.has(id)) continue;
+    messages.push({
+      id,
+      from: parseGeneratorSender(senderText),
+      subject,
+      intro: text.slice(0, 180),
+      text,
+      html: htmlBody,
+      createdAt: new Date(now - (i * 1000)).toISOString(),
+      seen: seen.has(id),
+      verifications: [],
+      _generator: true
+    });
+  }
+  return messages;
+}
+
+async function fetchGeneratorMessages(email, { retryEmpty = false } = {}) {
+  const attempts = retryEmpty ? 4 : 1;
+  let messages = [];
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const html = await fetchGeneratorHtml(email);
+    messages = parseGeneratorMessages(html, email);
+    if (messages.length || !retryEmpty || attempt === attempts - 1) break;
+    await delay(1800);
+  }
+  return messages;
+}
+
+async function getMessageDetail(email, message) {
+  if (!email || !message) return null;
+  if (isGeneratorEmail(email)) return message;
+  const { data } = await apiForEmail(email, `/messages/${encodeURIComponent(message.id)}`);
+  return data;
 }
 
 function extractMessageItems(data) {
@@ -1293,30 +1431,33 @@ async function verifyEmailSession(email) {
 }
 
 async function fetchMessages(email, { updateUi = true, retryEmpty = false } = {}) {
+  if (isGeneratorEmail(email)) {
+    const messages = await fetchGeneratorMessages(email, { retryEmpty });
+    if (updateUi) ui.inboxMessages = messages;
+    return messages;
+  }
+
+  if (!isMailTmEmail(email)) throw new Error('هذا الإيميل مضاف للتنظيم فقط ولا يمكن قراءة صندوقه.');
+
   const attempts = retryEmpty ? 4 : 1;
   let unique = [];
-
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     if (attempt === 0) await verifyEmailSession(email);
-
     const first = await apiForEmail(email, withCacheBuster('/messages?page=1'), { cache: 'no-store' });
     let messages = extractMessageItems(first.data);
     const total = Number(first.data?.['hydra:totalItems'] ?? first.data?.totalItems ?? messages.length);
     const pageSize = Math.max(1, messages.length || 30);
     const pages = Math.min(20, Math.ceil(total / pageSize));
-
     for (let page = 2; page <= pages; page += 1) {
       const next = await apiForEmail(email, withCacheBuster(`/messages?page=${page}`), { cache: 'no-store' });
       const batch = extractMessageItems(next.data);
       if (!batch.length) break;
       messages = messages.concat(batch);
     }
-
     unique = [...new Map(messages.filter((message) => message?.id).map((message) => [message.id, message])).values()];
     if (unique.length || !retryEmpty || attempt === attempts - 1) break;
     await delay(1800);
   }
-
   if (updateUi) ui.inboxMessages = unique;
   return unique;
 }
@@ -1324,7 +1465,7 @@ async function fetchMessages(email, { updateUi = true, retryEmpty = false } = {}
 async function openInbox(emailId) {
   const email = getEmail(emailId);
   if (!email) return;
-  if (!isMailTmEmail(email)) { toast('صندوق الوارد متاح للإيميلات المنشأة تلقائياً فقط.', 'info'); return; }
+  if (!hasRemoteInbox(email)) { toast('صندوق الوارد متاح للإيميلات المنشأة تلقائياً فقط.', 'info'); return; }
   ui.inboxEmailId = emailId;
   ui.inboxFilter = 'all';
   ui.inboxSearch = '';
@@ -1376,7 +1517,13 @@ async function openMessage(messageId, archiveId = '') {
   if (!email) return;
   openSheet('<div class="skeleton" style="height:110px"></div><div class="skeleton" style="height:180px;margin-top:12px"></div>');
   try {
-    const { data } = await apiForEmail(email, `/messages/${encodeURIComponent(messageId)}`);
+    let summary = ui.inboxMessages.find((item) => item.id === messageId) || null;
+    if (!summary && isGeneratorEmail(email)) {
+      const messages = await fetchMessages(email, { updateUi: true, retryEmpty: false });
+      summary = messages.find((item) => item.id === messageId) || null;
+    }
+    const data = isGeneratorEmail(email) ? summary : (await apiForEmail(email, `/messages/${encodeURIComponent(messageId)}`)).data;
+    if (!data) throw new Error('تعذر العثور على الرسالة.');
     ui.messageDetail = data;
     renderMessageDetailSheet(data, email);
   } catch (error) {
@@ -1388,7 +1535,7 @@ async function openMessage(messageId, archiveId = '') {
 async function fetchLatestCode(emailId) {
   const email = getEmail(emailId);
   if (!email) return;
-  if (!isMailTmEmail(email)) {
+  if (!hasRemoteInbox(email)) {
     toast('جلب الكود والروابط يعمل فقط مع الإيميلات التي تم إنشاؤها تلقائياً.', 'info', 5000);
     return;
   }
@@ -1407,12 +1554,9 @@ async function fetchLatestCode(emailId) {
       .slice(0, 8);
 
     if (!newest.length) {
-      const legacyDomain = LEGACY_UNRELIABLE_DOMAINS.has(emailDomain(email.address));
       openSheet(`
         <div class="sheet-title"><h2>جلب الكود والروابط</h2><button class="close-btn" data-action="close-sheet">×</button></div>
-        ${emptyState('📭', 'لا توجد رسائل حالياً', legacyDomain
-          ? 'هذا الإيميل أُنشئ على نطاق احتياطي قديم وقد لا يستقبل الرسائل. أنشئ إيميلاً جديداً بعد تحديث الملف.'
-          : 'تم فحص البريد عدة مرات ولم تصل رسالة حتى الآن. انتظر قليلاً ثم اضغط تحديث.')}
+        ${emptyState('📭', 'لا توجد رسائل حالياً', 'تم فحص البريد عدة مرات ولم تصل رسالة حتى الآن. انتظر قليلاً ثم اضغط تحديث.')}
         <button class="btn primary wide" data-action="fetch-code" data-email-id="${email.localId}">تحديث</button>
       `);
       return;
@@ -1423,7 +1567,7 @@ async function fetchLatestCode(emailId) {
     let matchedMessage = null;
 
     for (const message of newest) {
-      const { data: detail } = await apiForEmail(email, `/messages/${encodeURIComponent(message.id)}`);
+      const detail = await getMessageDetail(email, message);
       const foundCode = extractFourDigitCode(detail);
       const foundLinks = extractMessageLinks(detail);
       if (foundCode || foundLinks.length) {
@@ -1534,6 +1678,15 @@ async function markMessageSeen(messageId) {
   const email = getEmail(ui.inboxEmailId);
   if (!email) return;
   try {
+    if (isGeneratorEmail(email)) {
+      if (!email.generatorSeenIds.includes(messageId)) email.generatorSeenIds.push(messageId);
+      ui.messageDetail = { ...ui.messageDetail, seen: true };
+      ui.inboxMessages = ui.inboxMessages.map((m) => m.id === messageId ? { ...m, seen: true } : m);
+      saveState();
+      toast('تم تعليم الرسالة كمقروءة محلياً.');
+      renderMessageDetailSheet(ui.messageDetail, email);
+      return;
+    }
     const { data } = await apiForEmail(email, `/messages/${encodeURIComponent(messageId)}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/merge-patch+json' },
@@ -1547,17 +1700,27 @@ async function markMessageSeen(messageId) {
 }
 
 async function deleteMessage(messageId) {
-  const ok = await confirmDialog({ title:'حذف الرسالة', message:'سيتم حذف الرسالة نهائياً من Mail.tm. لا يمكن التراجع عن ذلك.', confirmText:'حذف نهائياً', danger:true });
-  if (ok !== 'confirm') return;
   const email = getEmail(ui.inboxEmailId);
   if (!email) return;
+  const localOnly = isGeneratorEmail(email);
+  const ok = await confirmDialog({
+    title:'حذف الرسالة',
+    message: localOnly ? 'سيتم إخفاء الرسالة من هذا الموقع فقط. صندوق Generator.email العام لا يوفر حذفاً عبر هذا الموقع.' : 'سيتم حذف الرسالة نهائياً من خدمة البريد. لا يمكن التراجع عن ذلك.',
+    confirmText: localOnly ? 'إخفاء الرسالة' : 'حذف نهائياً',
+    danger:true
+  });
+  if (ok !== 'confirm') return;
   try {
-    await apiForEmail(email, `/messages/${encodeURIComponent(messageId)}`, { method:'DELETE' });
+    if (localOnly) {
+      if (!email.generatorDeletedIds.includes(messageId)) email.generatorDeletedIds.push(messageId);
+    } else {
+      await apiForEmail(email, `/messages/${encodeURIComponent(messageId)}`, { method:'DELETE' });
+    }
     ui.inboxMessages = ui.inboxMessages.filter((m) => m.id !== messageId);
     email.archivedMessageIds = email.archivedMessageIds.filter((id) => id !== messageId);
     state.archivedMessages = state.archivedMessages.filter((m) => !(m.emailId === email.localId && m.messageId === messageId));
     saveState();
-    toast('تم حذف الرسالة.');
+    toast(localOnly ? 'تم إخفاء الرسالة محلياً.' : 'تم حذف الرسالة.');
     renderInboxSheet();
   } catch (error) { toast(error.message, 'error'); }
 }
@@ -1568,7 +1731,7 @@ async function archiveMessage(messageId) {
   let detail = ui.messageDetail?.id === messageId ? ui.messageDetail : null;
   const summary = ui.inboxMessages.find((m) => m.id === messageId) || {};
   if (!detail) {
-    try { detail = (await apiForEmail(email, `/messages/${encodeURIComponent(messageId)}`)).data; }
+    try { detail = isGeneratorEmail(email) ? summary : (await apiForEmail(email, `/messages/${encodeURIComponent(messageId)}`)).data; }
     catch (_) { detail = summary; }
   }
   if (!email.archivedMessageIds.includes(messageId)) email.archivedMessageIds.push(messageId);
@@ -1791,7 +1954,7 @@ async function compressImage(file) {
 
 function openExistingModal() {
   openModal(`
-    <h2>إضافة حساب Mail.tm</h2>
+    <h2>إضافة حساب بريد قديم</h2>
     <p>أدخل البريد وكلمة المرور. سيتم التحقق منهما عبر API قبل حفظ الحساب.</p>
     <div class="form-grid">
       <div class="field"><label>البريد الإلكتروني</label><input id="existingEmail" class="input" type="email" dir="ltr" autocomplete="username" placeholder="name@domain.com"></div>
@@ -2038,7 +2201,7 @@ function restoreSale(saleId) {
 }
 
 function openApiInfo() {
-  openModal(`<h2>معلومات API</h2><p>يتصل الموقع مباشرة من المتصفح بخدمة Mail.tm عبر HTTPS باستخدام Fetch API. يتم إنشاء الحسابات، استخراج Token، جلب الرسائل، تعليمها كمقروءة وحذفها من خلال واجهة Mail.tm الرسمية. لا يوجد خادم وسيط ولا تُرسل بياناتك إلى خدمة تخزين خارجية.</p><div class="notice">يحتاج تشغيل عمليات البريد إلى اتصال إنترنت. أفضل تشغيل المشروع من GitHub Pages أو أي استضافة HTTPS ثابتة.</div><button class="btn primary wide" style="margin-top:14px" data-action="close-modal">حسناً</button>`);
+  openModal(`<h2>معلومات البريد</h2><p>الإيميلات الجديدة تُنشأ محلياً على النطاق <b>${GENERATOR_DOMAIN}</b> وتُقرأ رسائلها من Generator.email. لأن المتصفح يمنع قراءة صفحات مواقع أخرى مباشرةً في بعض الاستضافات، يستخدم الموقع جسر CORS عند الحاجة لجلب HTML ثم يحلله داخل المتصفح. لا توجد قاعدة بيانات للموقع ولا يتم تخزين بياناتك على خادم خاص بالمشروع.</p><div class="notice">جلب الرسائل يحتاج اتصال إنترنت. عند الضغط على تحديث تتم قراءة الصندوق من جديد واستخراج كود 4 أرقام والروابط من أحدث الرسائل.</div><button class="btn primary wide" style="margin-top:14px" data-action="close-modal">حسناً</button>`);
 }
 
 function openAbout() {
