@@ -14,7 +14,7 @@ const PORT = Number(process.env.PORT || 3000);
 const GENERATOR_BASE = 'https://generator.email';
 const GENERATOR_DOMAIN = '5xu.vn';
 const TELEGRAM_BOT_TOKEN = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
-const MAIL_READER_BUILD = '2026-08-08-inbox9-cookie-v4';
+const MAIL_READER_BUILD = '2026-08-08-inbox9-cookie-v5-dedup';
 const TELEGRAM_ALLOWED_IDS = new Set(
   String(process.env.TELEGRAM_ALLOWED_IDS || '')
     .split(',')
@@ -50,6 +50,47 @@ function normalizeUrl(value = '') {
   } catch {
     return '';
   }
+}
+
+function uniqueUrls(values = []) {
+  const out = [];
+  const seen = new Set();
+  for (const value of Array.isArray(values) ? values : []) {
+    const url = normalizeUrl(value);
+    if (!url) continue;
+    const key = url;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(url);
+  }
+  return out;
+}
+
+function urlsInText(text = '') {
+  const matches = String(text || '').match(/https?:\/\/[^\s<>'"]+/gi) || [];
+  return uniqueUrls(matches.map((raw) => raw.replace(/[),.;"'<>]+$/g, '')));
+}
+
+function dedupeUrlsInText(text = '') {
+  const seen = new Set();
+  const lines = String(text || '').split(/\r?\n/);
+  const output = [];
+
+  for (let line of lines) {
+    const matches = line.match(/https?:\/\/[^\s<>'"]+/gi) || [];
+    for (const raw of matches) {
+      const cleaned = raw.replace(/[),.;"'<>]+$/g, '');
+      const url = normalizeUrl(cleaned);
+      if (!url) continue;
+      if (seen.has(url)) {
+        line = line.replace(raw, '').replace(/\s{2,}/g, ' ').trim();
+      } else {
+        seen.add(url);
+      }
+    }
+    if (line.trim()) output.push(line.trim());
+  }
+  return output.join('\n');
 }
 
 function extractCodes(text = '') {
@@ -166,8 +207,10 @@ function getFullMessageLikePython($, node) {
     const href = normalizeUrl(decodeBasicEntities($(el).attr('href') || ''));
     const title = $(el).text().replace(/\s+/g, ' ').trim();
     if (href) {
-      if (!links.includes(href)) links.push(href);
-      $(el).replaceWith(`\n${title ? `${title}\n` : ''}${href}\n`);
+      const isNew = !links.includes(href);
+      if (isNew) links.push(href);
+      // الرابط نفسه يظهر مرة واحدة فقط حتى لو تكرر داخل HTML الرسالة.
+      $(el).replaceWith(`\n${title ? `${title}\n` : ''}${isNew ? `${href}\n` : ''}`);
     }
   });
 
@@ -178,9 +221,14 @@ function getFullMessageLikePython($, node) {
       const inner = cheerio.load(decodeBasicEntities(embedded));
       inner('a[href]').each((__, a) => {
         const href = normalizeUrl(decodeBasicEntities(inner(a).attr('href') || ''));
-        if (href && !links.includes(href)) links.push(href);
+        const title = inner(a).text().replace(/\s+/g, ' ').trim();
+        if (!href) return;
+        const isNew = !links.includes(href);
+        if (isNew) links.push(href);
+        inner(a).replaceWith(`\n${title ? `${title}\n` : ''}${isNew ? `${href}\n` : ''}`);
       });
-      $(el).replaceWith(`\n${inner.root().text()}\n${links.join('\n')}\n`);
+      // لا نلحق قائمة links العامة هنا؛ كانت تسبب تكرار الروابط مع كل iframe.
+      $(el).replaceWith(`\n${inner.root().text()}\n`);
     }
   });
 
@@ -198,8 +246,10 @@ function getFullMessageLikePython($, node) {
     if (url && !links.includes(url)) links.push(url);
   }
 
-  if (!text && links.length) text = links.join('\n');
-  return { text, htmlBody, links };
+  text = dedupeUrlsInText(text);
+  const dedupedLinks = uniqueUrls(links);
+  if (!text && dedupedLinks.length) text = dedupedLinks.join('\n');
+  return { text, htmlBody, links: dedupedLinks };
 }
 
 function normalizeGeneratorColumns($, root) {
@@ -246,7 +296,7 @@ function parseMailbox(html, email) {
     let subject = subjectRaw || 'بدون عنوان';
     let text = bodyData.text;
     const htmlBody = bodyData.htmlBody;
-    const links = [...bodyData.links];
+    let links = uniqueUrls(bodyData.links);
 
     // إذا كانت بنية الصفحة مختلفة قليلاً، نقرأ بيانات To/From/Subject/Received من أقرب حاوية.
     const anchorNode = bodies[i] || senders[i] || subjects[i] || null;
@@ -293,6 +343,8 @@ function parseMailbox(html, email) {
       const url = normalizeUrl(decodeBasicEntities(raw.replace(/[),.;"'<>]+$/g, '')));
       if (url && !links.includes(url)) links.push(url);
     }
+    links = uniqueUrls(links);
+    text = dedupeUrlsInText(text);
     if (!text && links.length) text = links.join('\n');
 
     const normalizedSender = String(senderText || '').trim();
@@ -743,7 +795,7 @@ function profileDetailKeyboard(email, profile) {
 function messageInlineKeyboard(message) {
   const rows = [];
   const codes = Array.isArray(message.codes) ? message.codes.slice(0, 5) : [];
-  const links = Array.isArray(message.links) ? message.links.slice(0, 6) : [];
+  const links = uniqueUrls(message.links).slice(0, 6);
   for (const code of codes) rows.push([{ text: `📋 نسخ ${code}`, copy_text: { text: String(code) } }]);
   links.forEach((url, index) => rows.push([{ text: `🔗 فتح الرابط ${index + 1}`, url }]));
   return rows.length ? { inline_keyboard: rows } : undefined;
@@ -756,10 +808,13 @@ function formatTelegramMessage(message, index = 0, emailAddress = '') {
     ? (senderName && senderName !== senderAddress ? `${senderName} <${senderAddress}>` : senderAddress)
     : (senderName || 'غير معروف');
   const subject = message?.subject || 'بدون عنوان';
-  const body = String(message?.text || message?.intro || '').trim();
+  const body = dedupeUrlsInText(String(message?.text || message?.intro || '').trim());
   const received = message?.receivedAt || message?.createdAt || '';
   const codes = Array.isArray(message?.codes) && message.codes.length ? `\n\n🔢 الأكواد: ${message.codes.join(' - ')}` : '';
-  const links = Array.isArray(message?.links) && message.links.length ? `\n\n🔗 الروابط:\n${message.links.slice(0, 10).join('\n')}` : '';
+  const bodyUrls = new Set(urlsInText(body));
+  const extraLinks = uniqueUrls(message?.links).filter((url) => !bodyUrls.has(url)).slice(0, 10);
+  // لا نعيد طباعة الرابط في قسم الروابط إذا كان موجوداً أصلاً داخل نص الرسالة.
+  const links = extraLinks.length ? `\n\n🔗 الروابط:\n${extraLinks.join('\n')}` : '';
   return [
     index >= 0 ? `📬 الرسالة ${index + 1}` : '🔔 وصلت رسالة جديدة',
     `📧 إلى: ${message?.to || emailAddress || ''}`,
@@ -769,7 +824,7 @@ function formatTelegramMessage(message, index = 0, emailAddress = '') {
     '',
     '━━━━━━━━━━━━━━',
     '',
-    body || (message?.links?.length ? message.links.join('\n') : '(لا يوجد نص ظاهر؛ تم عرض جميع البيانات التي أمكن استخراجها)'),
+    body || (uniqueUrls(message?.links).length ? uniqueUrls(message?.links).join('\n') : '(لا يوجد نص ظاهر؛ تم عرض جميع البيانات التي أمكن استخراجها)'),
     codes,
     links
   ].filter((x) => x !== '').join('\n');
