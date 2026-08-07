@@ -1,4 +1,4 @@
-const APP_BUILD = "2026-08-08-auto-inbox-v3";
+const APP_BUILD = "2026-08-08-auto-inbox-v4";
 'use strict';
 
 /* تطبيق ثابت بالكامل: جميع البيانات تحفظ داخل LocalStorage فقط. */
@@ -682,7 +682,7 @@ function renderSettings() {
         <div class="setting-row"><div class="setting-label"><span class="setting-icon">◐</span><div><b>المظهر</b><small>داكن، فاتح أو تلقائي</small></div></div><select class="select" style="width:145px" data-setting-select="theme"><option value="dark" ${s.theme==='dark'?'selected':''}>داكن</option><option value="light" ${s.theme==='light'?'selected':''}>فاتح</option><option value="auto" ${s.theme==='auto'?'selected':''}>تلقائي</option></select></div>
         <div class="setting-row"><div class="setting-label"><span class="setting-icon">●</span><div><b>لون الواجهة</b><small>اختر اللون الأساسي</small></div></div><div class="color-dots">${['#0A84FF','#5E5CE6','#BF5AF2','#FF375F','#FF9F0A','#30D158'].map(c=>`<button class="color-dot ${s.accent===c?'active':''}" style="background:${c}" data-action="set-accent" data-color="${c}" aria-label="${c}"></button>`).join('')}</div></div>
         ${settingSwitch('showPasswords','إظهار كلمات المرور','تبقى مخفية افتراضياً',s.showPasswords,'◉')}
-        <div class="setting-row"><div class="setting-label"><span class="setting-icon">⏱</span><div><b>مدة انتظار الرسائل</b><small>الفحص كل 5 ثوانٍ وبحد أقصى دقيقة</small></div></div><select class="select" style="width:120px" data-setting-select="waitDuration"><option value="30" ${s.waitDuration===30?'selected':''}>30 ثانية</option><option value="45" ${s.waitDuration===45?'selected':''}>45 ثانية</option><option value="60" ${s.waitDuration===60?'selected':''}>60 ثانية</option></select></div>
+        <div class="setting-row"><div class="setting-label"><span class="setting-icon">⏱</span><div><b>مدة انتظار الرسائل</b><small>المراقبة تلقائية كل 3 ثوانٍ</small></div></div><select class="select" style="width:120px" data-setting-select="waitDuration"><option value="30" ${s.waitDuration===30?'selected':''}>30 ثانية</option><option value="45" ${s.waitDuration===45?'selected':''}>45 ثانية</option><option value="60" ${s.waitDuration===60?'selected':''}>60 ثانية</option></select></div>
         ${settingSwitch('sound','صوت وصول الرسالة','تشغيل نغمة قصيرة عند وصول الكود',s.sound,'♫')}
         ${settingSwitch('vibration','اهتزاز الهاتف','عند وصول رسالة أثناء الانتظار',s.vibration,'⌁')}
         ${settingSwitch('lockEnabled','قفل الموقع برمز PIN','رمز من 4 إلى 6 أرقام',s.lockEnabled,'🔒', true)}
@@ -809,10 +809,7 @@ function renderInboxSheet() {
   openSheet(`
     <div data-inbox-root>
       <div class="sheet-title"><div><h2>صندوق الوارد</h2><p class="helper">${escapeHTML(email.address)}</p></div><button class="close-btn" data-action="close-sheet">×</button></div>
-      <div class="btn-row" style="margin-bottom:10px">
-        <button class="btn primary small" data-action="refresh-messages" data-email-id="${email.localId}" ${ui.inboxLoading?'disabled':''}>${ui.inboxLoading?'<span class="spinner"></span> جاري التحديث':'تحديث'}</button>
-        ${polling && polling.emailId === email.localId ? `<button class="btn danger small" data-action="stop-waiting">إيقاف الانتظار</button>` : `<button class="btn warning small" data-action="start-waiting" data-email-id="${email.localId}">${pollingText}</button>`}
-      </div>
+      <div class="notice" style="margin-bottom:10px">🔔 المراقبة التلقائية مفعّلة — يتم فحص هذا الإيميل كل 3 ثوانٍ، وتظهر الرسائل هنا بدون الضغط على أي زر.</div>
       <div class="segmented">
         <button class="${ui.inboxFilter==='all'?'active':''}" data-action="set-inbox-filter" data-filter="all">الكل</button>
         <button class="${ui.inboxFilter==='unread'?'active':''}" data-action="set-inbox-filter" data-filter="unread">غير المقروءة</button>
@@ -822,7 +819,7 @@ function renderInboxSheet() {
       <div class="message-list">
         ${ui.inboxLoading ? '<div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>' : list.length ? list.map(messageCard).join('') : emptyState('📭', ui.inboxFilter==='archived'?'لا توجد رسائل مؤرشفة':'لا توجد رسائل حالياً', ui.inboxFilter==='archived'?'الرسائل المؤرشفة محلياً ستظهر هنا.':'يتم فحص هذا الصندوق تلقائياً، وستظهر الرسالة هنا فور اكتشافها.')}
       </div>
-      <p class="helper" style="text-align:center;margin-top:12px">اسحب النافذة إلى الأسفل من أعلى القائمة لتحديث الرسائل.</p>
+      <p class="helper" style="text-align:center;margin-top:12px">لا تحتاج إلى تحديث يدوي؛ الصندوق يتحدث تلقائياً.</p>
     </div>
   `);
 }
@@ -1903,7 +1900,7 @@ function stopPolling(showToast = true) {
 // لا تحتاج الضغط على «رسائل» أو «تحديث». عندما تكون الصفحة مفتوحة
 // يفحص الموقع جميع الإيميلات النشطة ويُحدّث الصندوق فور وصول رسالة جديدة.
 // =========================
-const WEBSITE_AUTO_CHECK_MS = 5000;
+const WEBSITE_AUTO_CHECK_MS = 3000;
 let websiteAutoMonitorTimer = null;
 let websiteAutoMonitorBusy = false;
 
