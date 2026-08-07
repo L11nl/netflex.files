@@ -2,9 +2,13 @@
 
 /* تطبيق ثابت بالكامل: جميع البيانات تحفظ داخل LocalStorage فقط. */
 const STORAGE_KEY = 'cd-mail-profile-manager-v1';
-const GENERATOR_DOMAIN = '5xu.vn';
 const GENERATOR_BASE = 'https://generator.email';
+const GENERATOR_HOME_PAGES = ['https://generator.email/', 'https://ja.generator.email/'];
 const GENERATOR_CORS_PROXY = 'https://corsproxy.io/?url=';
+// 5xu.vn كان مستخدماً سابقاً، لكنه لم يعد نطاقاً مناسباً لهذه الواجهة.
+const LEGACY_GENERATOR_DOMAINS = ['5xu.vn'];
+// تُستخدم فقط إذا تعذر جلب قائمة النطاقات الحية من Generator.email.
+const GENERATOR_FALLBACK_DOMAINS = ['casterview.xyz', 'edshol.net', 'rumahpremium.com', 'xazyxe.com', 'sds-awe.top'];
 // تبقى هذه المزودات فقط لفتح الحسابات القديمة المحفوظة سابقاً.
 const MAIL_PROVIDERS = [
   { id: 'mailtm', name: 'Mail.tm', apiBase: 'https://api.mail.tm' },
@@ -52,6 +56,7 @@ let ui = {
 let modalResolver = null;
 let polling = null;
 let pullStartY = 0;
+let generatorDomainCache = { domains: [], fetchedAt: 0 };
 
 function initialState() {
   return {
@@ -116,7 +121,7 @@ function normalizeState(raw) {
     const domain = String(address).split('@').pop().trim().toLowerCase();
     let provider = email.provider;
     if (!['generator', 'mailtm', 'mailgw', 'local'].includes(provider)) {
-      provider = domain === GENERATOR_DOMAIN ? 'generator' : ((email.token || email.password) ? 'mailtm' : 'local');
+      provider = LEGACY_GENERATOR_DOMAINS.includes(domain) ? 'generator' : ((email.token || email.password) ? 'mailtm' : 'local');
     }
     return {
       localId: email.localId || makeId(),
@@ -126,7 +131,7 @@ function normalizeState(raw) {
       token: email.token || '',
       provider,
       apiBase: email.apiBase || (provider === 'mailgw' ? 'https://api.mail.gw' : provider === 'mailtm' ? 'https://api.mail.tm' : ''),
-      generatorDomain: email.generatorDomain || (provider === 'generator' ? (domain || GENERATOR_DOMAIN) : ''),
+      generatorDomain: email.generatorDomain || (provider === 'generator' ? (domain || GENERATOR_FALLBACK_DOMAINS[0]) : ''),
       generatorSeenIds: Array.isArray(email.generatorSeenIds) ? email.generatorSeenIds : [],
       generatorDeletedIds: Array.isArray(email.generatorDeletedIds) ? email.generatorDeletedIds : [],
       localName: email.localName || '',
@@ -210,7 +215,7 @@ function emailStatusLabel(status) {
 }
 
 function isGeneratorEmail(email) {
-  return email?.provider === 'generator' || (!email?.provider && emailDomain(email?.address) === GENERATOR_DOMAIN);
+  return email?.provider === 'generator' || (!email?.provider && LEGACY_GENERATOR_DOMAINS.includes(emailDomain(email?.address)));
 }
 
 function isMailTmEmail(email) {
@@ -1086,7 +1091,7 @@ function buildEmailRecord({ mailTmId, address, password, token, provider = 'gene
   return {
     localId: makeId(), mailTmId: mailTmId || '', address, password: password || '', token: token || '', provider,
     apiBase: apiBase || (provider === 'mailgw' ? 'https://api.mail.gw' : provider === 'mailtm' ? 'https://api.mail.tm' : ''),
-    generatorDomain: provider === 'generator' ? (emailDomain(address) || GENERATOR_DOMAIN) : '',
+    generatorDomain: provider === 'generator' ? (emailDomain(address) || GENERATOR_FALLBACK_DOMAINS[0]) : '',
     generatorSeenIds: [], generatorDeletedIds: [],
     localName: '', createdAt, status: 'active', archivedAt: null, completedAt: null,
     archivedMessageIds: [], profiles
@@ -1135,6 +1140,83 @@ async function getProviderDomains(provider) {
   return domains;
 }
 
+
+function isKnownGeneratorDomain(domain = '') {
+  const value = String(domain || '').trim().toLowerCase();
+  if (!value) return false;
+  return LEGACY_GENERATOR_DOMAINS.includes(value)
+    || GENERATOR_FALLBACK_DOMAINS.includes(value)
+    || generatorDomainCache.domains.includes(value);
+}
+
+function extractGeneratorDomainsFromHtml(html = '') {
+  const doc = new DOMParser().parseFromString(String(html || ''), 'text/html');
+  const found = [];
+  const add = (raw) => {
+    const value = String(raw || '').trim().toLowerCase().replace(/^@/, '');
+    if (!/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}$/i.test(value)) return;
+    if (['generator.email', 'emailfake.com', 'email-fake.com', 'mail-temp.com', 'tempm.com', 'corsproxy.io'].includes(value)) return;
+    if (!found.includes(value)) found.push(value);
+  };
+
+  doc.querySelectorAll('option').forEach((option) => {
+    add(option.value);
+    add(option.textContent);
+  });
+  doc.querySelectorAll('[data-domain]').forEach((node) => add(node.getAttribute('data-domain')));
+
+  // احتياط في حال غيّر الموقع تركيب قائمة النطاقات.
+  if (!found.length) {
+    const text = doc.body?.innerText || String(html || '');
+    const matches = text.match(/\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}\b/gi) || [];
+    matches.forEach(add);
+  }
+  return found.slice(0, 40);
+}
+
+async function fetchLiveGeneratorDomains(force = false) {
+  const freshEnough = generatorDomainCache.domains.length && (Date.now() - generatorDomainCache.fetchedAt) < 15 * 60 * 1000;
+  if (!force && freshEnough) return generatorDomainCache.domains;
+
+  let lastError = null;
+  for (const home of GENERATOR_HOME_PAGES) {
+    const fresh = `${home}${home.includes('?') ? '&' : '?'}_=${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const candidates = [
+      `${GENERATOR_CORS_PROXY}${encodeURIComponent(fresh)}`,
+      fresh
+    ];
+    for (const url of candidates) {
+      try {
+        const html = await fetchTextWithTimeout(url, { headers: { 'Accept': 'text/html,application/xhtml+xml' } }, 18000);
+        const domains = extractGeneratorDomainsFromHtml(html)
+          .filter((domain) => !LEGACY_GENERATOR_DOMAINS.includes(domain));
+        if (domains.length) {
+          generatorDomainCache = { domains, fetchedAt: Date.now() };
+          return domains;
+        }
+      } catch (error) {
+        lastError = error;
+      }
+    }
+  }
+
+  if (GENERATOR_FALLBACK_DOMAINS.length) {
+    generatorDomainCache = { domains: [...GENERATOR_FALLBACK_DOMAINS], fetchedAt: Date.now() };
+    return generatorDomainCache.domains;
+  }
+  throw new Error(lastError?.message || 'تعذر الحصول على نطاق بريد فعال حالياً.');
+}
+
+async function getActiveGeneratorDomain() {
+  const domains = await fetchLiveGeneratorDomains(false);
+  if (!domains.length) throw new Error('لا يوجد نطاق بريد فعال حالياً. حاول لاحقاً.');
+  // استخدم نطاقاً من أوائل القائمة الحية وبدّل بينها لتقليل الاعتماد على نطاق واحد.
+  const pool = domains.slice(0, Math.min(domains.length, 8));
+  const bytes = new Uint32Array(1);
+  crypto.getRandomValues(bytes);
+  return pool[bytes[0] % pool.length];
+}
+
 async function createMailAccount() {
   if (isBusy('create-email')) return;
   setBusy('create-email', true);
@@ -1142,7 +1224,8 @@ async function createMailAccount() {
   try {
     let address = '';
     for (let attempt = 0; attempt < 40; attempt += 1) {
-      const candidate = `${randomGeneratorUsername()}@${GENERATOR_DOMAIN}`;
+      const domain = await getActiveGeneratorDomain();
+      const candidate = `${randomGeneratorUsername()}@${domain}`;
       if (!state.emails.some((email) => email.address.toLowerCase() === candidate.toLowerCase())) {
         address = candidate;
         break;
@@ -1230,7 +1313,7 @@ async function saveLocalEmail() {
     return;
   }
 
-  const provider = emailDomain(address) === GENERATOR_DOMAIN ? 'generator' : 'local';
+  const provider = isKnownGeneratorDomain(emailDomain(address)) ? 'generator' : 'local';
   const email = buildEmailRecord({
     address,
     password: '',
@@ -1537,6 +1620,10 @@ async function fetchLatestCode(emailId) {
   if (!email) return;
   if (!hasRemoteInbox(email)) {
     toast('جلب الكود والروابط يعمل فقط مع الإيميلات التي تم إنشاؤها تلقائياً.', 'info', 5000);
+    return;
+  }
+  if (isGeneratorEmail(email) && LEGACY_GENERATOR_DOMAINS.includes(emailDomain(email.address))) {
+    toast('هذا الإيميل يستخدم نطاق 5xu.vn القديم، وهو لم يعد نطاقاً فعالاً في Generator.email. أنشئ إيميلاً جديداً من الموقع.', 'error', 8000);
     return;
   }
 
@@ -2201,7 +2288,7 @@ function restoreSale(saleId) {
 }
 
 function openApiInfo() {
-  openModal(`<h2>معلومات البريد</h2><p>الإيميلات الجديدة تُنشأ محلياً على النطاق <b>${GENERATOR_DOMAIN}</b> وتُقرأ رسائلها من Generator.email. لأن المتصفح يمنع قراءة صفحات مواقع أخرى مباشرةً في بعض الاستضافات، يستخدم الموقع جسر CORS عند الحاجة لجلب HTML ثم يحلله داخل المتصفح. لا توجد قاعدة بيانات للموقع ولا يتم تخزين بياناتك على خادم خاص بالمشروع.</p><div class="notice">جلب الرسائل يحتاج اتصال إنترنت. عند الضغط على تحديث تتم قراءة الصندوق من جديد واستخراج كود 4 أرقام والروابط من أحدث الرسائل.</div><button class="btn primary wide" style="margin-top:14px" data-action="close-modal">حسناً</button>`);
+  openModal(`<h2>معلومات البريد</h2><p>عند إنشاء إيميل جديد، يجلب الموقع نطاقاً فعالاً حالياً من Generator.email بدلاً من الاعتماد على نطاق ثابت قد يتوقف لاحقاً. ثم تُقرأ الرسائل من صندوق ذلك الإيميل. لأن المتصفح يمنع قراءة صفحات مواقع أخرى مباشرةً في بعض الاستضافات، يستخدم الموقع جسر CORS عند الحاجة لجلب HTML ثم يحلله داخل المتصفح.</p><div class="notice">إذا كان لديك إيميل قديم على نطاق توقف عن العمل، أنشئ إيميلاً جديداً. زر تحديث يعيد قراءة الصندوق ويستخرج كود 4 أرقام والروابط من أحدث الرسائل.</div><button class="btn primary wide" style="margin-top:14px" data-action="close-modal">حسناً</button>`);
 }
 
 function openAbout() {
