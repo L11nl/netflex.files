@@ -86,65 +86,179 @@ function parseSender(raw = '') {
   };
 }
 
+function cleanHeaderLikeText(value = '', headerWords = []) {
+  const text = String(value || '').replace(/\s+/g, ' ').trim();
+  const lower = text.toLowerCase();
+  if (!text) return '';
+  if (headerWords.some((word) => lower === String(word).toLowerCase())) return '';
+  return text;
+}
+
+function extractTimestamp(text = '') {
+  const value = String(text || '');
+  const match = value.match(/\b(20\d{2})[-\/](\d{1,2})[-\/](\d{1,2})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?\b/);
+  if (!match) return '';
+  const [, y, m, d, hh, mm, ss = '00'] = match;
+  const iso = new Date(`${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}T${String(hh).padStart(2,'0')}:${mm}:${ss}Z`);
+  return Number.isNaN(iso.getTime()) ? '' : iso.toISOString();
+}
+
+function extractBodyFromNode($, node) {
+  if (!node) return { text: '', htmlBody: '', links: [] };
+  const body = $(node).clone();
+  const links = [];
+  const htmlBody = body.html() || '';
+
+  body.find('iframe').each((_, el) => {
+    const embedded = $(el).attr('srcdoc') || $(el).attr('data-srcdoc') || $(el).attr('data-content') || '';
+    if (embedded) $(el).replaceWith(`\n${embedded}\n`);
+  });
+
+  body.find('a[href]').each((_, el) => {
+    const href = normalizeUrl($(el).attr('href') || '');
+    if (!href) return;
+    if (!links.includes(href)) links.push(href);
+    const title = $(el).text().trim();
+    $(el).replaceWith(`\n${title ? `${title}\n` : ''}${href}\n`);
+  });
+
+  let text = body.text()
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join('\n');
+
+  if (!text && htmlBody) {
+    text = cheerio.load(htmlBody).root().text()
+      .split(/\r?\n/).map((line) => line.trim()).filter(Boolean).join('\n');
+  }
+
+  const plainUrls = `${text}\n${htmlBody}`.match(/https?:\/\/[^\s<>'"]+/gi) || [];
+  for (const raw of plainUrls) {
+    const url = normalizeUrl(raw.replace(/[),.;"'<>]+$/g, ''));
+    if (url && !links.includes(url)) links.push(url);
+  }
+
+  if (!text && links.length) text = links.join('\n');
+  return { text, htmlBody, links };
+}
+
 function parseMailbox(html, email) {
   const $ = cheerio.load(String(html || ''));
   const table = $('#email-table');
   const root = table.length ? table : $.root();
 
-  let senders = root.find('.from_div_45g45gg').toArray();
-  let subjects = root.find('.subj_div_45g45gg').toArray();
-  let bodies = root.find('.mess_bodiyy').toArray();
+  const senderNodes = root.find('.from_div_45g45gg').toArray()
+    .filter((node) => {
+      const text = cleanHeaderLikeText($(node).text(), ['From', 'المرسل', 'من']);
+      return Boolean(text && /@/.test(text));
+    });
 
-  if (!senders.length) senders = $('.from_div_45g45gg').toArray();
-  if (!subjects.length) subjects = $('.subj_div_45g45gg').toArray();
-  if (!bodies.length) bodies = $('.mess_bodiyy').toArray();
+  const subjectNodes = root.find('.subj_div_45g45gg').toArray()
+    .filter((node) => Boolean(cleanHeaderLikeText($(node).text(), ['Subject', 'العنوان', 'الموضوع'])));
 
-  const count = Math.max(senders.length, subjects.length, bodies.length);
+  const bodyNodes = root.find('.mess_bodiyy').toArray()
+    .filter((node) => {
+      const probe = extractBodyFromNode($, node);
+      return Boolean(probe.text || probe.htmlBody || probe.links.length);
+    });
+
   const messages = [];
+  const count = Math.max(senderNodes.length, subjectNodes.length, bodyNodes.length);
 
   for (let i = 0; i < count; i += 1) {
-    const senderText = senders[i] ? $(senders[i]).text().trim() : 'غير معروف';
-    const subject = subjects[i] ? $(subjects[i]).text().trim() : 'بدون عنوان';
-    const bodyNode = bodies[i] || null;
+    const bodyNode = bodyNodes[i] || null;
 
-    let text = '';
-    let htmlBody = '';
-    const links = [];
-
-    if (bodyNode) {
-      const body = $(bodyNode).clone();
-      htmlBody = body.html() || '';
-
-      body.find('a[href]').each((_, el) => {
-        const href = normalizeUrl($(el).attr('href') || '');
-        if (!href) return;
-        if (!links.includes(href)) links.push(href);
-        const title = $(el).text().trim();
-        $(el).replaceWith(`\n${title ? `${title}\n` : ''}${href}\n`);
-      });
-
-      text = body.text()
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter(Boolean)
-        .join('\n');
-
-      const plainUrls = text.match(/https?:\/\/[^\s<>'\"]+/gi) || [];
-      for (const raw of plainUrls) {
-        const url = normalizeUrl(raw.replace(/[),.;]+$/g, ''));
-        if (url && !links.includes(url)) links.push(url);
+    let container = bodyNode ? $(bodyNode) : (senderNodes[i] ? $(senderNodes[i]) : (subjectNodes[i] ? $(subjectNodes[i]) : null));
+    if (container?.length) {
+      let cursor = container;
+      for (let depth = 0; depth < 7; depth += 1) {
+        const senderInside = cursor.find('.from_div_45g45gg').toArray()
+          .map((n) => cleanHeaderLikeText($(n).text(), ['From', 'المرسل', 'من']))
+          .find((t) => t && /@/.test(t));
+        if (senderInside) {
+          container = cursor;
+          break;
+        }
+        cursor = cursor.parent();
+        if (!cursor.length) break;
       }
     }
 
-    const codes = extractCodes(`${subject}\n${text}`);
+    const senderFromContainer = container?.length
+      ? container.find('.from_div_45g45gg').toArray()
+          .map((n) => cleanHeaderLikeText($(n).text(), ['From', 'المرسل', 'من']))
+          .find((t) => t && /@/.test(t))
+      : '';
+
+    const subjectFromContainer = container?.length
+      ? container.find('.subj_div_45g45gg').toArray()
+          .map((n) => cleanHeaderLikeText($(n).text(), ['Subject', 'العنوان', 'الموضوع']))
+          .find(Boolean)
+      : '';
+
+    let senderText = senderFromContainer
+      || (senderNodes[i] ? cleanHeaderLikeText($(senderNodes[i]).text(), ['From', 'المرسل', 'من']) : '')
+      || 'غير معروف';
+
+    let subject = subjectFromContainer
+      || (subjectNodes[i] ? cleanHeaderLikeText($(subjectNodes[i]).text(), ['Subject', 'العنوان', 'الموضوع']) : '')
+      || 'بدون عنوان';
+
+    const bodyData = extractBodyFromNode($, bodyNode);
+    let text = bodyData.text;
+    const htmlBody = bodyData.htmlBody;
+    const links = [...bodyData.links];
+
+    const containerText = container?.length ? container.text().replace(/\s+/g, ' ').trim() : '';
+    const containerHtml = container?.length ? (container.html() || '') : '';
+
+    const toMatch = containerText.match(/\bTo:\s*([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})/i);
+    const fromMatch = containerText.match(/\bFrom:\s*([^]*?)(?=\s+(?:Subject:|Received:|To:)|$)/i);
+    const subjectMatch = containerText.match(/\bSubject:\s*([^]*?)(?=\s+(?:Received:|To:|From:)|$)/i);
+    const receivedMatch = containerText.match(/\bReceived:\s*([0-9]{4}[-\/][0-9]{1,2}[-\/][0-9]{1,2}\s+[0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?)/i);
+
+    if ((!senderText || senderText === 'غير معروف') && fromMatch?.[1]) senderText = fromMatch[1].trim();
+    if ((!subject || subject === 'بدون عنوان') && subjectMatch?.[1]) subject = subjectMatch[1].trim();
+
+    if (!text && containerText) {
+      let fallback = containerText;
+      fallback = fallback
+        .replace(/\bTo:\s*[^\s]+/i, '')
+        .replace(/\bFrom:\s*.*?(?=\s+Subject:|\s+Received:|$)/i, '')
+        .replace(/\bSubject:\s*.*?(?=\s+Received:|$)/i, '')
+        .replace(/\bReceived:\s*[0-9]{4}[-\/][0-9]{1,2}[-\/][0-9]{1,2}\s+[0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?/i, '')
+        .replace(/\b(Delete Message|View source|From|Subject|Time(?:\s*\(UTC\))?)\b/gi, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (fallback) text = fallback;
+    }
+
+    const allUrls = `${text}\n${containerHtml}`.match(/https?:\/\/[^\s<>'"]+/gi) || [];
+    for (const raw of allUrls) {
+      const url = normalizeUrl(raw.replace(/[),.;"'<>]+$/g, ''));
+      if (url && !links.includes(url)) links.push(url);
+    }
+    if (!text && links.length) text = links.join('\n');
+
+    const sender = parseSender(senderText);
+    const createdAt = receivedMatch?.[1]
+      ? (extractTimestamp(receivedMatch[1]) || new Date().toISOString())
+      : (extractTimestamp(containerText) || new Date(Date.now() - i * 1000).toISOString());
+
+    const codes = extractCodes(`${subject}\n${text}\n${links.join('\n')}`);
+    const toAddress = toMatch?.[1] || email;
+
     messages.push({
-      id: stableId(senderText, subject, text || htmlBody),
-      from: parseSender(senderText),
+      id: stableId(sender.address || sender.name || senderText, subject, `${receivedMatch?.[1] || ''}|${text || htmlBody}|${links.join('|')}`),
+      to: toAddress,
+      from: sender,
       subject,
-      intro: text.slice(0, 180),
+      intro: text.slice(0, 220),
       text,
       html: htmlBody,
-      createdAt: new Date(Date.now() - i * 1000).toISOString(),
+      createdAt,
+      receivedAt: createdAt,
       seen: false,
       verifications: codes,
       codes,
@@ -153,7 +267,15 @@ function parseMailbox(html, email) {
     });
   }
 
-  return messages;
+  return [...new Map(
+    messages
+      .filter((message) => {
+        const from = String(message?.from?.address || message?.from?.name || '').trim().toLowerCase();
+        const subject = String(message?.subject || '').trim().toLowerCase();
+        return from !== 'from' && subject !== 'subject';
+      })
+      .map((message) => [message.id, message])
+  ).values()];
 }
 
 async function fetchMailboxHtml(email) {
@@ -231,7 +353,7 @@ async function getMailbox(email) {
 // =========================
 
 const EMAIL_LIFETIME_MS = 6 * 24 * 60 * 60 * 1000;
-const AUTO_CHECK_INTERVAL_MS = Math.max(5000, Number(process.env.AUTO_CHECK_INTERVAL_MS || 8000));
+const AUTO_CHECK_INTERVAL_MS = Math.max(5000, Number(process.env.AUTO_CHECK_INTERVAL_MS || 5000));
 const DEFAULT_PINS = ['1212', '1001', '2121', '2026', '2002'];
 
 function randomGeneratorUsername() {
@@ -408,8 +530,7 @@ function telegramKeyboard() {
   return {
     keyboard: [
       [{ text: '➕ إنشاء إيميل' }, { text: '📧 الإيميلات' }],
-      [{ text: '📨 فحص الرسائل' }, { text: '✅ الإيميلات المباعة' }],
-      [{ text: '🌐 فتح الموقع' }]
+      [{ text: '✅ الإيميلات المباعة' }, { text: '🌐 فتح الموقع' }]
     ],
     resize_keyboard: true,
     is_persistent: true
@@ -458,14 +579,15 @@ function emailSummaryText(email) {
     `🗓️ تم الإنشاء قبل ${emailAgeDays(email)} يوم`,
     `⏳ الحذف من البوت بعد: ${emailRemainingText(email)}`,
     `👥 البروفايلات: 🟢 ${counts.available}  🟡 ${counts.review}  🔴 ${counts.sold}`,
-    `📌 الحالة: ${email.status === 'completed' ? 'مكتمل/مباع' : 'نشط'}`
+    `📌 الحالة: ${email.status === 'completed' ? 'مكتمل/مباع' : 'نشط'}`,
+    '🔔 الرسائل: تصل تلقائياً بدون زر فحص'
   ].filter(Boolean).join('\n');
 }
 
 function emailDetailKeyboard(email) {
   const rows = [
     [{ text: '📋 نسخ الإيميل', copy_text: { text: email.address } }],
-    [{ text: '👥 البروفايلات', callback_data: `profiles:${email.id}` }, { text: '📨 الرسائل', callback_data: `inbox:${email.id}` }],
+    [{ text: '👥 البروفايلات', callback_data: `profiles:${email.id}` }],
     [{ text: '✏️ اسم محلي', callback_data: `rename:${email.id}` }, { text: '🗑️ حذف الآن', callback_data: `delete:${email.id}` }],
     [{ text: '⬅️ الإيميلات', callback_data: 'emails:active' }]
   ];
@@ -500,7 +622,6 @@ function profileDetailKeyboard(email, profile) {
   } else {
     rows.push([{ text: '♻️ استرجاع البروفايل', callback_data: `pstatus:${email.id}:${profile.number}:available` }]);
   }
-  rows.push([{ text: '📨 جلب آخر رسالة', callback_data: `inbox:${email.id}` }]);
   rows.push([{ text: '⬅️ البروفايلات', callback_data: `profiles:${email.id}` }]);
   return { inline_keyboard: rows };
 }
@@ -515,21 +636,26 @@ function messageInlineKeyboard(message) {
 }
 
 function formatTelegramMessage(message, index = 0, emailAddress = '') {
-  const sender = message?.from?.address || message?.from?.name || 'غير معروف';
+  const senderName = String(message?.from?.name || '').trim();
+  const senderAddress = String(message?.from?.address || '').trim();
+  const sender = senderAddress
+    ? (senderName && senderName !== senderAddress ? `${senderName} <${senderAddress}>` : senderAddress)
+    : (senderName || 'غير معروف');
   const subject = message?.subject || 'بدون عنوان';
-  const body = String(message?.text || '').trim();
+  const body = String(message?.text || message?.intro || '').trim();
+  const received = message?.receivedAt || message?.createdAt || '';
   const codes = Array.isArray(message?.codes) && message.codes.length ? `\n\n🔢 الأكواد: ${message.codes.join(' - ')}` : '';
-  const links = Array.isArray(message?.links) && message.links.length ? `\n\n🔗 الروابط:\n${message.links.slice(0, 8).join('\n')}` : '';
+  const links = Array.isArray(message?.links) && message.links.length ? `\n\n🔗 الروابط:\n${message.links.slice(0, 10).join('\n')}` : '';
   return [
     index >= 0 ? `📬 الرسالة ${index + 1}` : '🔔 وصلت رسالة جديدة',
-    emailAddress ? `📧 إلى: ${emailAddress}` : '',
-    '',
+    `📧 إلى: ${message?.to || emailAddress || ''}`,
     `👤 من: ${sender}`,
     `📝 العنوان: ${subject}`,
+    received ? `🕒 وقت الوصول: ${received}` : '',
     '',
     '━━━━━━━━━━━━━━',
     '',
-    body || '(الرسالة بدون نص ظاهر)',
+    body || (message?.links?.length ? message.links.join('\n') : '(لا يوجد نص ظاهر؛ تم عرض جميع البيانات التي أمكن استخراجها)'),
     codes,
     links
   ].filter((x) => x !== '').join('\n');
@@ -935,12 +1061,6 @@ function startTelegramBot() {
       }
       if (text === '📧 الإيميلات' || text === '/emails') { await showEmailList(bot, chatId, false); return; }
       if (text === '✅ الإيميلات المباعة' || text === '/sold') { await showEmailList(bot, chatId, true); return; }
-      if (text === '📨 فحص الرسائل' || text === '/check') {
-        const email = getBotEmail(chatId);
-        if (email) await sendMailboxToTelegram(bot, chatId, email.id);
-        else await bot.sendMessage(chatId, 'لا يوجد إيميل محدد. أنشئ إيميل أولاً.');
-        return;
-      }
       if (text === '🌐 فتح الموقع') {
         const site = publicWebsiteUrl();
         if (site) await bot.sendMessage(chatId, '🌐 الموقع:', { reply_markup: { inline_keyboard: [[{ text: 'فتح الموقع', url: site }]] } });
@@ -953,7 +1073,6 @@ function startTelegramBot() {
       { command: 'start', description: 'تشغيل البوت' },
       { command: 'new', description: 'إنشاء إيميل عشوائي أو يدوي' },
       { command: 'emails', description: 'عرض الإيميلات' },
-      { command: 'check', description: 'فحص رسائل الإيميل المحدد' },
       { command: 'sold', description: 'الإيميلات المباعة' }
     ]).catch((error) => console.warn('[telegram] setMyCommands:', error.message));
 
