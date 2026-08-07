@@ -1352,16 +1352,18 @@ async function copyText(text, notify = true) {
   if (notify) toast(text.match(/^\d{4,8}$/) ? 'تم نسخ الكود.' : 'تم النسخ بنجاح.');
 }
 
-function generatorInboxTargets(email) {
+function generatorInboxUrl(email) {
   const address = String(email?.address || '').trim().toLowerCase();
-  const [username, domain] = address.split('@');
-  if (!username || !domain) return [];
-  return [
-    // أول مسار هو نفس المسار المستخدم في كود Python حرفياً.
-    `${GENERATOR_BASE}/${encodeURIComponent(domain)}/${encodeURIComponent(username)}`,
-    // المسار الحالي الذي تعرضه Generator.email للوصول لصندوق محدد.
-    `${GENERATOR_BASE}/${encodeURIComponent(address)}`
-  ];
+  if (!address || !address.includes('@')) return '';
+  // هذا هو رابط الصندوق المطلوب حرفياً:
+  // https://generator.email/inbox9/username@5xu.vn
+  return `${GENERATOR_BASE}/inbox9/${address}`;
+}
+
+function generatorInboxTargets(email) {
+  const exact = generatorInboxUrl(email);
+  if (!exact) return [];
+  return [exact];
 }
 
 async function fetchTextWithTimeout(url, options = {}, timeoutMs = 22000) {
@@ -1386,44 +1388,43 @@ function isRequestedGeneratorMailboxHtml(html, email) {
   const address = String(email?.address || '').trim().toLowerCase();
   const [username, domain] = address.split('@');
 
-  // إذا كانت هناك رسائل فهذه أقوى علامة على أننا داخل صندوق Generator.email الصحيح.
+  // عندما توجد رسائل، هذه هي نفس العناصر التي يعتمد عليها كود Python.
   if (/id=["']email-table["']|mess_bodiyy|subj_div_45g45gg|from_div_45g45gg/i.test(source)) return true;
 
-  // في الصندوق الفارغ نتأكد أن الصفحة نفسها تشير إلى البريد المطلوب، لا مجرد صفحة Generator.email عامة.
+  // عند كون الصندوق فارغاً، يجب أن تكون الصفحة نفسها مرتبطة بعنواننا.
   if (address && lower.includes(address)) return true;
   if (username && domain && lower.includes(username) && lower.includes(domain)) return true;
   return false;
 }
 
 async function fetchGeneratorHtml(email) {
-  const targets = generatorInboxTargets(email);
-  if (!targets.length) throw new Error('عنوان الإيميل غير صالح.');
+  const target = generatorInboxUrl(email);
+  if (!target) throw new Error('عنوان الإيميل غير صالح.');
+
+  const freshTarget = `${target}?_=${Date.now()}-${Math.random().toString(16).slice(2)}`;
   let lastError = null;
 
-  for (const target of targets) {
-    const freshTarget = `${target}${target.includes('?') ? '&' : '?'}_=${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    // جرب عدة جسور لأن أي جسر عام قد يتوقف أو يحدد الطلبات مؤقتاً.
-    const candidates = [
-      ...GENERATOR_CORS_BUILDERS.map((build) => build(freshTarget)),
-      freshTarget
-    ];
+  // نحاول قراءة نفس رابط inbox9 مباشرة أولاً. إذا منع المتصفح CORS،
+  // نقرأ نفس الرابط عبر جسور CORS بدون تغيير عنوان الصندوق نفسه.
+  const candidates = [
+    freshTarget,
+    ...GENERATOR_CORS_BUILDERS.map((build) => build(freshTarget))
+  ];
 
-    for (const url of candidates) {
-      try {
-        const html = await fetchTextWithTimeout(url, {
-          headers: { 'Accept': 'text/html,application/xhtml+xml' }
-        }, 22000);
+  for (const url of candidates) {
+    try {
+      const html = await fetchTextWithTimeout(url, {
+        headers: { 'Accept': 'text/html,application/xhtml+xml' }
+      }, 25000);
 
-        // الخطأ السابق كان قبول أي صفحة HTML حتى لو كانت صفحة عامة؛ الآن لا نقبل إلا صندوق البريد المطلوب.
-        if (isRequestedGeneratorMailboxHtml(html, email)) return html;
-        lastError = new Error('تم فتح خدمة البريد لكن لم يتم فتح صندوق هذا الإيميل تحديداً.');
-      } catch (error) {
-        lastError = error;
-      }
+      if (isRequestedGeneratorMailboxHtml(html, email)) return html;
+      lastError = new Error('تم فتح Generator.email لكن الصفحة التي رجعت ليست صندوق هذا الإيميل.');
+    } catch (error) {
+      lastError = error;
     }
   }
 
-  throw new Error(lastError?.message || 'تعذر فتح صندوق Generator.email من المتصفح.');
+  throw new Error(lastError?.message || 'تعذر قراءة صندوق Generator.email من المتصفح.');
 }
 
 function cleanMessageText(bodyElement) {
@@ -1649,6 +1650,12 @@ async function openMessage(messageId, archiveId = '') {
 async function fetchLatestCode(emailId) {
   const email = getEmail(emailId);
   if (!email) return;
+  const generatorUrl = isGeneratorEmail(email) ? generatorInboxUrl(email) : '';
+  // حسب الطلب: عند الضغط نفتح رابط الصندوق الأصلي نفسه في تبويب جديد،
+  // وفي نفس الوقت يواصل الموقع قراءة نفس الرابط واستخراج الكود والروابط منه.
+  if (generatorUrl) {
+    try { window.open(generatorUrl, '_blank', 'noopener,noreferrer'); } catch (_) {}
+  }
   if (!hasRemoteInbox(email)) {
     toast('جلب الكود والروابط يعمل فقط مع الإيميلات التي تم إنشاؤها تلقائياً.', 'info', 5000);
     return;
@@ -1656,7 +1663,8 @@ async function fetchLatestCode(emailId) {
   openSheet(`
     <div class="sheet-title"><h2>جلب الكود والروابط</h2><button class="close-btn" data-action="close-sheet">×</button></div>
     <div class="skeleton" style="height:120px"></div>
-    <p class="helper" style="text-align:center">جاري التحقق من آخر الرسائل...</p>
+    <p class="helper" style="text-align:center">جاري فتح صندوق البريد وفحص آخر الرسائل...</p>
+    ${generatorUrl ? `<a class="btn ghost wide" href="${escapeHTML(generatorUrl)}" target="_blank" rel="noopener noreferrer">فتح صندوق Generator.email</a>` : ''}
   `);
   ui.inboxEmailId = emailId;
 
@@ -1669,7 +1677,8 @@ async function fetchLatestCode(emailId) {
     if (!newest.length) {
       openSheet(`
         <div class="sheet-title"><h2>جلب الكود والروابط</h2><button class="close-btn" data-action="close-sheet">×</button></div>
-        ${emptyState('📭', 'لا توجد رسائل حالياً', 'تم فحص البريد عدة مرات ولم تصل رسالة حتى الآن. انتظر قليلاً ثم اضغط تحديث.')}
+        ${emptyState('📭', 'لا توجد رسائل حالياً', 'تم فحص رابط صندوق البريد نفسه ولم تظهر رسالة حتى الآن.')}
+        ${generatorUrl ? `<a class="btn ghost wide" href="${escapeHTML(generatorUrl)}" target="_blank" rel="noopener noreferrer">فتح الصندوق الأصلي</a>` : ''}
         <button class="btn primary wide" data-action="fetch-code" data-email-id="${email.localId}">تحديث</button>
       `);
       return;
@@ -1710,6 +1719,7 @@ async function fetchLatestCode(emailId) {
       ` : '<div class="notice no-code-notice">لم يوجد كود من 4 أرقام في هذه الرسالة، لكن تم العثور على روابط.</div>'}
       ${renderFetchedLinks(links)}
       <p class="helper code-source">${escapeHTML(matchedMessage?.subject || 'آخر رسالة وصلت')}</p>
+      ${generatorUrl ? `<a class="btn ghost wide" href="${escapeHTML(generatorUrl)}" target="_blank" rel="noopener noreferrer">فتح الصندوق الأصلي</a>` : ''}
       <button class="btn ghost wide" data-action="fetch-code" data-email-id="${email.localId}">تحديث</button>
     `);
   } catch (error) {
@@ -2314,7 +2324,7 @@ function restoreSale(saleId) {
 }
 
 function openApiInfo() {
-  openModal(`<h2>معلومات البريد</h2><p>عند إنشاء إيميل جديد، يجلب الموقع نطاقاً فعالاً حالياً من Generator.email بدلاً من الاعتماد على نطاق ثابت قد يتوقف لاحقاً. ثم تُقرأ الرسائل من صندوق ذلك الإيميل. لأن المتصفح يمنع قراءة صفحات مواقع أخرى مباشرةً في بعض الاستضافات، يستخدم الموقع جسر CORS عند الحاجة لجلب HTML ثم يحلله داخل المتصفح.</p><div class="notice">إذا كان لديك إيميل قديم على نطاق توقف عن العمل، أنشئ إيميلاً جديداً. زر تحديث يعيد قراءة الصندوق ويستخرج كود 4 أرقام والروابط من أحدث الرسائل.</div><button class="btn primary wide" style="margin-top:14px" data-action="close-modal">حسناً</button>`);
+  openModal(`<h2>معلومات البريد</h2><p>عند إنشاء إيميل جديد يستخدم الموقع النطاق 5xu.vn. ولجلب الرسائل يبني رابط الصندوق مباشرة بالشكل https://generator.email/inbox9/EMAIL ثم يقرأ HTML لهذا الصندوق ويستخرج الرسائل والكود والروابط. إذا منع المتصفح القراءة المباشرة بسبب CORS، يستخدم الموقع جسر CORS لنفس رابط inbox9 دون تغيير الإيميل.</p><div class="notice">إذا كان لديك إيميل قديم على نطاق توقف عن العمل، أنشئ إيميلاً جديداً. زر تحديث يعيد قراءة الصندوق ويستخرج كود 4 أرقام والروابط من أحدث الرسائل.</div><button class="btn primary wide" style="margin-top:14px" data-action="close-modal">حسناً</button>`);
 }
 
 function openAbout() {
