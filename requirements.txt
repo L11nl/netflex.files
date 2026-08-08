@@ -1,4 +1,0 @@
-pyTelegramBotAPI>=4.28,<5
-requests>=2.32,<3
-beautifulsoup4>=4.13,<5
-playwright>=1.55,<2
