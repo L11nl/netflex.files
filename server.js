@@ -14,7 +14,7 @@ const PORT = Number(process.env.PORT || 3000);
 const GENERATOR_BASE = 'https://generator.email';
 const GENERATOR_DOMAIN = '5xu.vn';
 const TELEGRAM_BOT_TOKEN = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
-const MAIL_READER_BUILD = '2026-08-08-inbox9-fast-v6-smart-links';
+const MAIL_READER_BUILD = '2026-08-08-inbox9-v7-code-history-profile-colors';
 const TELEGRAM_ALLOWED_IDS = new Set(
   String(process.env.TELEGRAM_ALLOWED_IDS || '')
     .split(',')
@@ -864,6 +864,42 @@ function profileStatusEmoji(status) {
   return status === 'sold' ? '🔴' : status === 'review' ? '🟡' : '🟢';
 }
 
+// نفس ألوان البروفايلات الافتراضية في الموقع:
+// 1 #0A84FF، 2 #FFD60A، 3 #FF3B30، 4 #00677A، 5 #30D18A.
+function profileColorEmoji(number) {
+  return ['🔵', '🟡', '🔴', '🔷', '🟢'][Number(number) - 1] || '⚪';
+}
+
+function profileColorLabel(number) {
+  return ['أزرق', 'أصفر', 'أحمر', 'تركوازي', 'أخضر'][Number(number) - 1] || 'افتراضي';
+}
+
+function arabicCount(value, one, two, few, many) {
+  const n = Math.max(0, Math.floor(Number(value) || 0));
+  if (n === 1) return one;
+  if (n === 2) return two;
+  if (n >= 3 && n <= 10) return `${n} ${few}`;
+  return `${n} ${many}`;
+}
+
+function relativeArabicTime(dateValue) {
+  const t = new Date(dateValue || '').getTime();
+  if (!Number.isFinite(t)) return 'للتو';
+  const seconds = Math.max(0, Math.floor((Date.now() - t) / 1000));
+  if (seconds < 2) return 'قبل ثانية';
+  if (seconds < 60) return `قبل ${arabicCount(seconds, 'ثانية', 'ثانيتين', 'ثوانٍ', 'ثانية')}`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `قبل ${arabicCount(minutes, 'دقيقة', 'دقيقتين', 'دقائق', 'دقيقة')}`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `قبل ${arabicCount(hours, 'ساعة', 'ساعتين', 'ساعات', 'ساعة')}`;
+  const days = Math.floor(hours / 24);
+  if (days < 30) return `قبل ${arabicCount(days, 'يوم', 'يومين', 'أيام', 'يوماً')}`;
+  const months = Math.floor(days / 30);
+  if (months < 12) return `قبل ${arabicCount(months, 'شهر', 'شهرين', 'أشهر', 'شهراً')}`;
+  const years = Math.floor(days / 365);
+  return `قبل ${arabicCount(years, 'سنة', 'سنتين', 'سنوات', 'سنة')}`;
+}
+
 function emailSummaryText(email) {
   const counts = { available: 0, review: 0, sold: 0 };
   email.profiles.forEach((p) => { counts[p.status] = (counts[p.status] || 0) + 1; });
@@ -881,6 +917,7 @@ function emailSummaryText(email) {
 function emailDetailKeyboard(email) {
   const rows = [
     [{ text: '📋 نسخ الإيميل', copy_text: { text: email.address } }],
+    [{ text: '📥 جلب آخر الرسائل', callback_data: `latestmail:${email.id}` }],
     [{ text: '👥 البروفايلات', callback_data: `profiles:${email.id}` }],
     [{ text: '✏️ اسم محلي', callback_data: `rename:${email.id}` }, { text: '🗑️ حذف الآن', callback_data: `delete:${email.id}` }],
     [{ text: '⬅️ الإيميلات', callback_data: 'emails:active' }]
@@ -890,7 +927,7 @@ function emailDetailKeyboard(email) {
 
 function profilesKeyboard(email) {
   const rows = email.profiles.map((profile) => ([{
-    text: `${profileStatusEmoji(profile.status)} بروفايل ${profile.number} · ${profile.pin}`,
+    text: `${profileColorEmoji(profile.number)} بروفايل ${profile.number} · ${profileStatusEmoji(profile.status)} ${profileStatusLabel(profile.status)} · ${profile.pin}`,
     callback_data: `profile:${email.id}:${profile.number}`
   }]));
   rows.push([{ text: '⬅️ رجوع للإيميل', callback_data: `email:${email.id}` }]);
@@ -900,6 +937,7 @@ function profilesKeyboard(email) {
 function profileDetailKeyboard(email, profile) {
   const rows = [
     [{ text: `📋 نسخ الرمز ${profile.pin}`, copy_text: { text: String(profile.pin) } }],
+    [{ text: '🔢 جلب الكود', callback_data: `latestcode:${email.id}:${profile.number}` }],
     [{ text: '📋 نسخ الإيميل', copy_text: { text: email.address } }],
     [{ text: '✏️ تغيير الرمز', callback_data: `pin:${email.id}:${profile.number}` }]
   ];
@@ -1069,6 +1107,131 @@ async function sendMailboxToTelegram(bot, chatId, emailId = '') {
   }
 }
 
+function latestCodeFromMessages(messages = []) {
+  for (const message of Array.isArray(messages) ? messages : []) {
+    const codes = Array.isArray(message?.codes) ? message.codes.filter(Boolean) : [];
+    if (codes.length) {
+      return {
+        code: String(codes[0]),
+        receivedAt: message.receivedAt || message.createdAt || '',
+        message
+      };
+    }
+  }
+  return null;
+}
+
+async function sendLatestCode(bot, chatId, emailId, profileNumber = 0) {
+  const email = getBotEmail(chatId, emailId);
+  if (!email) {
+    await bot.sendMessage(chatId, '❌ لم أجد هذا الإيميل في بيانات البوت.');
+    return;
+  }
+  const wait = await bot.sendMessage(chatId, `🔎 جاري جلب آخر كود...\n📧 ${email.address}`);
+  try {
+    const { messages } = await getMailbox(email.address);
+    const found = latestCodeFromMessages(messages);
+    try { await bot.deleteMessage(chatId, wait.message_id); } catch (_) {}
+    if (!found) {
+      await bot.sendMessage(chatId, `📭 لا يوجد كود ظاهر حالياً في آخر الرسائل.\n\n📧 ${email.address}`);
+      return;
+    }
+    const when = relativeArabicTime(found.receivedAt);
+    const profileLine = Number(profileNumber) ? `${profileColorEmoji(profileNumber)} البروفايل ${profileNumber}\n` : '';
+    await safeSendMessage(bot, chatId,
+      `${profileLine}🔢 آخر كود: ${found.code}\n⏱️ وصل هذا الكود ${when}\n📧 ${email.address}`,
+      { reply_markup: { inline_keyboard: [[{ text: `📋 نسخ الكود ${found.code}`, copy_text: { text: found.code } }]] } }
+    );
+  } catch (error) {
+    try { await bot.editMessageText(`❌ تعذر جلب الكود حالياً.\n\n${String(error?.message || error)}`, { chat_id: chatId, message_id: wait.message_id }); }
+    catch (_) { await bot.sendMessage(chatId, `❌ تعذر جلب الكود حالياً.\n${String(error?.message || error)}`); }
+  }
+}
+
+function fullTelegramMessageText(message, index = 0, emailAddress = '') {
+  const senderName = String(message?.from?.name || '').trim();
+  const senderAddress = String(message?.from?.address || '').trim();
+  const sender = senderAddress
+    ? (senderName && senderName !== senderAddress ? `${senderName} <${senderAddress}>` : senderAddress)
+    : (senderName || 'غير معروف');
+  const body = stripInvisibleNoise(String(message?.text || message?.intro || '')).trim();
+  const links = uniqueUserFacingLinks(message?.links || []);
+  const bodyUrls = new Set(urlsInText(body).map((url) => canonicalLinkKey(url) || url));
+  const extraLinks = links.filter((url) => !bodyUrls.has(canonicalLinkKey(url) || url));
+  const codes = Array.isArray(message?.codes) ? [...new Set(message.codes.map(String))] : [];
+  const lines = [
+    `📬 الرسالة ${index + 1}`,
+    `📧 إلى: ${message?.to || emailAddress || ''}`,
+    `👤 من: ${sender}`,
+    `📝 العنوان: ${message?.subject || 'بدون عنوان'}`,
+    (message?.receivedAt || message?.createdAt) ? `⏱️ وصلت ${relativeArabicTime(message.receivedAt || message.createdAt)}` : '',
+    '',
+    '━━━━━━━━━━━━━━',
+    '',
+    body || '(الرسالة بدون نص ظاهر)'
+  ].filter((line) => line !== '');
+  if (extraLinks.length) {
+    lines.push('', '🔗 الروابط:', ...extraLinks);
+  }
+  if (codes.length) lines.push('', `🔢 الأكواد: ${codes.join(' - ')}`);
+  return lines.join('\n');
+}
+
+async function sendLatestImportantMessages(bot, chatId, emailId) {
+  const email = getBotEmail(chatId, emailId);
+  if (!email) return;
+  const wait = await bot.sendMessage(chatId, `🔄 جاري جلب آخر الرسائل المهمة...\n📧 ${email.address}`);
+  try {
+    const { messages } = await getMailbox(email.address);
+    try { await bot.deleteMessage(chatId, wait.message_id); } catch (_) {}
+    if (!messages.length) {
+      await bot.sendMessage(chatId, `📭 لا توجد رسائل حالياً.\n📧 ${email.address}`);
+      return;
+    }
+    const important = messages.filter((message) =>
+      (Array.isArray(message?.codes) && message.codes.length) ||
+      (Array.isArray(message?.importantLinks) && message.importantLinks.length)
+    );
+    const selected = (important.length ? important : messages).slice(0, 3);
+    await bot.sendMessage(chatId, `📥 آخر الرسائل المهمة\n📧 ${email.address}`);
+    for (let i = 0; i < selected.length; i += 1) {
+      await sendFormattedMessage(bot, chatId, selected[i], i, email.address);
+    }
+    await safeSendMessage(bot, chatId, 'هل تريد عرض كل ما وصل لهذا الإيميل؟', {
+      reply_markup: { inline_keyboard: [[{ text: '📚 جلب كل الرسائل والكودات', callback_data: `allmail:${email.id}` }]] }
+    });
+  } catch (error) {
+    try { await bot.editMessageText(`❌ تعذر جلب آخر الرسائل.\n\n${String(error?.message || error)}`, { chat_id: chatId, message_id: wait.message_id }); }
+    catch (_) { await bot.sendMessage(chatId, `❌ تعذر جلب آخر الرسائل.\n${String(error?.message || error)}`); }
+  }
+}
+
+async function sendAllMessagesAndCodes(bot, chatId, emailId) {
+  const email = getBotEmail(chatId, emailId);
+  if (!email) return;
+  const wait = await bot.sendMessage(chatId, `📚 جاري جلب كل الرسائل والكودات...\n📧 ${email.address}`);
+  try {
+    const { messages } = await getMailbox(email.address);
+    try { await bot.deleteMessage(chatId, wait.message_id); } catch (_) {}
+    if (!messages.length) {
+      await bot.sendMessage(chatId, `📭 لا توجد رسائل حالياً.\n📧 ${email.address}`);
+      return;
+    }
+    await bot.sendMessage(chatId, `📚 كل الرسائل الحالية (${messages.length})\n📧 ${email.address}`);
+    for (let i = 0; i < messages.length; i += 1) {
+      const chunks = splitTelegramText(fullTelegramMessageText(messages[i], i, email.address));
+      for (const chunk of chunks) {
+        await safeSendMessage(bot, chatId, chunk, { disable_web_page_preview: true });
+      }
+      // مهلة صغيرة حتى لا نصطدم بحد الإرسال عند وجود رسائل كثيرة.
+      if (i < messages.length - 1) await new Promise((resolve) => setTimeout(resolve, 90));
+    }
+  } catch (error) {
+    try { await bot.editMessageText(`❌ تعذر جلب كل الرسائل والكودات.\n\n${String(error?.message || error)}`, { chat_id: chatId, message_id: wait.message_id }); }
+    catch (_) { await bot.sendMessage(chatId, `❌ تعذر جلب كل الرسائل والكودات.\n${String(error?.message || error)}`); }
+  }
+}
+
 function activeBotEmails(chat) {
   return chat.emails.filter((email) => email.status !== 'completed');
 }
@@ -1108,7 +1271,7 @@ async function showProfiles(bot, chatId, emailId, editMessageId = null) {
   const text = [
     `👥 بروفايلات ${email.address}`,
     '',
-    ...email.profiles.map((p) => `${profileStatusEmoji(p.status)} ${p.number}. الرمز: ${p.pin} · ${profileStatusLabel(p.status)}`)
+    ...email.profiles.map((p) => `${profileColorEmoji(p.number)} ${p.number}. الرمز: ${p.pin} · ${profileStatusEmoji(p.status)} ${profileStatusLabel(p.status)}`)
   ].join('\n');
   const options = { reply_markup: profilesKeyboard(email) };
   if (editMessageId) {
@@ -1123,10 +1286,11 @@ async function showProfileDetail(bot, chatId, emailId, number, editMessageId = n
   const profile = email.profiles.find((p) => p.number === Number(number));
   if (!profile) return;
   const text = [
-    `👤 البروفايل ${profile.number}`,
+    `${profileColorEmoji(profile.number)} البروفايل ${profile.number}`,
+    `🎨 اللون: ${profileColorLabel(profile.number)}`,
     `📧 ${email.address}`,
     `🔐 الرمز: ${profile.pin}`,
-    `📌 الحالة: ${profileStatusLabel(profile.status)}`
+    `📌 الحالة: ${profileStatusEmoji(profile.status)} ${profileStatusLabel(profile.status)}`
   ].join('\n');
   const options = { reply_markup: profileDetailKeyboard(email, profile) };
   if (editMessageId) {
@@ -1275,6 +1439,24 @@ function startTelegramBot() {
       if (data.startsWith('profile:')) {
         const [, emailId, number] = data.split(':');
         await showProfileDetail(bot, chatId, emailId, Number(number), messageId);
+        return;
+      }
+      if (data.startsWith('latestcode:')) {
+        const [, emailId, number] = data.split(':');
+        setSelectedBotEmail(chatId, emailId);
+        await sendLatestCode(bot, chatId, emailId, Number(number));
+        return;
+      }
+      if (data.startsWith('latestmail:')) {
+        const emailId = data.split(':')[1];
+        setSelectedBotEmail(chatId, emailId);
+        await sendLatestImportantMessages(bot, chatId, emailId);
+        return;
+      }
+      if (data.startsWith('allmail:')) {
+        const emailId = data.split(':')[1];
+        setSelectedBotEmail(chatId, emailId);
+        await sendAllMessagesAndCodes(bot, chatId, emailId);
         return;
       }
       if (data.startsWith('inbox:')) {
