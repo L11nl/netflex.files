@@ -648,6 +648,8 @@ async function getMailbox(email) {
 
 const EMAIL_LIFETIME_MS = 6 * 24 * 60 * 60 * 1000;
 const AUTO_CHECK_INTERVAL_MS = Math.max(1200, Number(process.env.AUTO_CHECK_INTERVAL_MS || 1500));
+const AUTO_NOTIFY_WINDOW_MS = 20 * 60 * 1000;
+const AUTO_NOTIFY_MAX_MESSAGES = 5;
 const DEFAULT_PINS = ['1212', '1001', '2121', '2026', '2002'];
 
 function randomGeneratorUsername() {
@@ -691,6 +693,8 @@ function makeBotEmailRecord(address, mode = 'random') {
     completedAt: null,
     profiles: [1, 2, 3, 4, 5].map(createBotProfile),
     seenMessageIds: [],
+    autoNotifyUntil: new Date(now + AUTO_NOTIFY_WINDOW_MS).toISOString(),
+    autoNotifyCount: 0,
     lastCheckedAt: null
   };
 }
@@ -720,6 +724,10 @@ function normalizeBotState(raw) {
           return { ...createBotProfile(number), ...old, number };
         }),
         seenMessageIds: Array.isArray(email.seenMessageIds) ? email.seenMessageIds : [],
+        autoNotifyUntil: email.autoNotifyUntil || new Date(new Date(createdAt).getTime() + AUTO_NOTIFY_WINDOW_MS).toISOString(),
+        autoNotifyCount: email.autoNotifyCount != null
+          ? Math.max(0, Math.min(AUTO_NOTIFY_MAX_MESSAGES, Math.floor(Number(email.autoNotifyCount) || 0)))
+          : Math.min(AUTO_NOTIFY_MAX_MESSAGES, Array.isArray(email.seenMessageIds) ? email.seenMessageIds.length : 0),
         lastCheckedAt: email.lastCheckedAt || null
       };
     }).filter((email) => isAllowedEmail(email.address));
@@ -900,6 +908,27 @@ function relativeArabicTime(dateValue) {
   return `قبل ${arabicCount(years, 'سنة', 'سنتين', 'سنوات', 'سنة')}`;
 }
 
+function autoNotifyInfo(email) {
+  const until = new Date(email?.autoNotifyUntil || '').getTime();
+  const sent = Math.max(0, Math.floor(Number(email?.autoNotifyCount) || 0));
+  const remainingMessages = Math.max(0, AUTO_NOTIFY_MAX_MESSAGES - sent);
+  const remainingMs = Number.isFinite(until) ? Math.max(0, until - Date.now()) : 0;
+  return {
+    active: remainingMs > 0 && remainingMessages > 0,
+    until,
+    sent,
+    remainingMessages,
+    remainingMs
+  };
+}
+
+function autoNotifyRemainingText(email) {
+  const info = autoNotifyInfo(email);
+  if (!info.active) return 'متوقف — استخدم جلب آخر الرسائل';
+  const minutes = Math.max(1, Math.ceil(info.remainingMs / 60000));
+  return `نشط ${minutes} دقيقة · متبقّي ${info.remainingMessages} من 5`;
+}
+
 function emailSummaryText(email) {
   const counts = { available: 0, review: 0, sold: 0 };
   email.profiles.forEach((p) => { counts[p.status] = (counts[p.status] || 0) + 1; });
@@ -910,7 +939,8 @@ function emailSummaryText(email) {
     `⏳ الحذف من البوت بعد: ${emailRemainingText(email)}`,
     `👥 البروفايلات: 🟢 ${counts.available}  🟡 ${counts.review}  🔴 ${counts.sold}`,
     `📌 الحالة: ${email.status === 'completed' ? 'مكتمل/مباع' : 'نشط'}`,
-    '🔔 الرسائل: تصل تلقائياً بدون زر فحص'
+    '🔔 التلقائي: أول 5 رسائل خلال أول 20 دقيقة فقط',
+    `⚡ الاستلام التلقائي: ${autoNotifyRemainingText(email)}`
   ].filter(Boolean).join('\n');
 }
 
@@ -1342,11 +1372,14 @@ async function monitorAllMailboxes(bot) {
       if (!isTelegramChatAllowed(chatId)) continue;
       for (const email of chat.emails) {
         if (new Date(email.expiresAt).getTime() <= Date.now()) continue;
+        // لا نراقب الصندوق بلا نهاية. الاستلام التلقائي يعمل فقط خلال
+        // أول 20 دقيقة ومن أجل أول 5 رسائل، وبعدها الجلب يصبح يدوياً.
+        if (!autoNotifyInfo(email).active) continue;
         jobs.push({ chatId, email });
       }
     }
 
-    // ثلاثة صناديق بالتوازي: أسرع بكثير مع عدد إيميلات كبير بدون فتح عشرات الطلبات دفعة واحدة.
+    // ثلاثة صناديق بالتوازي: سريع بدون فتح عشرات الطلبات دفعة واحدة.
     const concurrency = 3;
     for (let start = 0; start < jobs.length; start += concurrency) {
       const batch = jobs.slice(start, start + concurrency);
@@ -1354,13 +1387,34 @@ async function monitorAllMailboxes(bot) {
         try {
           const { messages } = await getMailbox(email.address);
           email.lastCheckedAt = new Date().toISOString();
+
+          const info = autoNotifyInfo(email);
+          if (!info.active) return;
+
           const seen = new Set(email.seenMessageIds || []);
+          // Generator.email يعيد الأحدث أولاً؛ نعكس الجديد حتى تصل الرسائل بالترتيب الصحيح.
           const fresh = messages.filter((message) => !seen.has(message.id)).reverse();
-          for (const message of messages) seen.add(message.id);
-          email.seenMessageIds = Array.from(seen).slice(-200);
-          for (const message of fresh.slice(-10)) {
-            await sendFormattedMessage(bot, chatId, message, -1, email.address);
+          const remaining = Math.max(0, AUTO_NOTIFY_MAX_MESSAGES - (Number(email.autoNotifyCount) || 0));
+          const toDeliver = fresh.slice(0, remaining);
+
+          for (const message of toDeliver) {
+            // لو انتهت الـ20 دقيقة أثناء الطلب، لا نرسل بعدها تلقائياً.
+            if (!autoNotifyInfo(email).active) break;
+            try {
+              await sendFormattedMessage(bot, chatId, message, -1, email.address);
+              seen.add(message.id);
+              email.autoNotifyCount = Math.min(
+                AUTO_NOTIFY_MAX_MESSAGES,
+                Math.max(0, Number(email.autoNotifyCount) || 0) + 1
+              );
+            } catch (sendError) {
+              // لا نعلّم الرسالة كمستلمة إذا فشل تيليجرام؛ حتى يحاولها في الدورة التالية.
+              console.warn(`[telegram-auto-send] ${email.address}:`, sendError?.message || sendError);
+              break;
+            }
           }
+
+          email.seenMessageIds = Array.from(seen).slice(-200);
         } catch (error) {
           console.warn(`[telegram-monitor] ${email.address}:`, error?.message || error);
         }
@@ -1405,7 +1459,7 @@ function startTelegramBot() {
       }
       getBotChat(chatId);
       await bot.sendMessage(chatId,
-        '📬 مدير الإيميلات والبروفايلات\n\nيمكنك إنشاء إيميل عشوائي أو يدوي، إدارة 5 بروفايلات لكل إيميل، واستلام الرسائل تلقائياً.\n\n⏳ كل إيميل يُحذف من بيانات البوت تلقائياً بعد 6 أيام.',
+        '📬 مدير الإيميلات والبروفايلات\n\nيمكنك إنشاء إيميل عشوائي أو يدوي وإدارة 5 بروفايلات لكل إيميل.\n\n🔔 أول 5 رسائل فقط تصل تلقائياً خلال أول 20 دقيقة من إنشاء الإيميل، وبعدها استخدم زر جلب آخر الرسائل.\n\n⏳ كل إيميل يُحذف من بيانات البوت تلقائياً بعد 6 أيام.',
         { reply_markup: telegramKeyboard() }
       );
     });
@@ -1422,8 +1476,10 @@ function startTelegramBot() {
       if (data === 'create:random') {
         const { email } = addBotEmail(chatId, newGeneratorEmail(), 'random');
         email.seenMessageIds = [];
+        email.autoNotifyUntil = new Date(Date.now() + AUTO_NOTIFY_WINDOW_MS).toISOString();
+        email.autoNotifyCount = 0;
         saveBotState();
-        await bot.sendMessage(chatId, `✅ تم إنشاء الإيميل العشوائي\n\n📧 ${email.address}\n⏳ سيُحذف من البوت بعد 6 أيام.`, { reply_markup: telegramKeyboard() });
+        await bot.sendMessage(chatId, `✅ تم إنشاء الإيميل العشوائي\n\n📧 ${email.address}\n🔔 أول 5 رسائل ستصل تلقائياً خلال 20 دقيقة فقط.\n📥 بعد ذلك استخدم زر جلب آخر الرسائل.\n⏳ سيُحذف من البوت بعد 6 أيام.`, { reply_markup: telegramKeyboard() });
         await showEmailDetail(bot, chatId, email.id);
         return;
       }
@@ -1549,9 +1605,16 @@ function startTelegramBot() {
         }
         chat.pending = null;
         const { email, created } = addBotEmail(chatId, `${local}@5xu.vn`, 'manual');
-        if (created) email.seenMessageIds = [];
+        if (created) {
+          email.seenMessageIds = [];
+          email.autoNotifyUntil = new Date(Date.now() + AUTO_NOTIFY_WINDOW_MS).toISOString();
+          email.autoNotifyCount = 0;
+          // للإيميل اليدوي: اعتبر الرسائل القديمة الموجودة قبل الإضافة كخط أساس،
+          // حتى لا يرسلها البوت على أنها رسائل وصلت للتو.
+          await establishMailboxBaseline(email);
+        }
         saveBotState();
-        await bot.sendMessage(chatId, `${created ? '✅ تم إضافة' : 'ℹ️ الإيميل موجود مسبقاً وتم اختياره'}\n\n📧 ${email.address}\n⏳ سيُحذف من البوت بعد 6 أيام.`, { reply_markup: telegramKeyboard() });
+        await bot.sendMessage(chatId, `${created ? '✅ تم إضافة' : 'ℹ️ الإيميل موجود مسبقاً وتم اختياره'}\n\n📧 ${email.address}\n${created ? '🔔 أول 5 رسائل جديدة ستصل تلقائياً خلال 20 دقيقة فقط.\n📥 بعد ذلك استخدم زر جلب آخر الرسائل.\n' : ''}⏳ سيُحذف من البوت بعد 6 أيام.`, { reply_markup: telegramKeyboard() });
         await showEmailDetail(bot, chatId, email.id);
         return;
       }
@@ -1642,6 +1705,8 @@ app.get('/health', (_req, res) => {
       configured: Boolean(TELEGRAM_BOT_TOKEN),
       status: telegramStatus,
       autoCheckSeconds: Math.round(AUTO_CHECK_INTERVAL_MS / 1000),
+      autoNotifyMinutes: Math.round(AUTO_NOTIFY_WINDOW_MS / 60000),
+      autoNotifyMaxMessages: AUTO_NOTIFY_MAX_MESSAGES,
       storedChats: Object.keys(botState.chats).length
     },
     time: new Date().toISOString()
