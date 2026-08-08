@@ -9,14 +9,16 @@ import threading
 import random
 import string
 import hashlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.header import decode_header
+from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse
 
 import requests
 import telebot
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, CopyTextButton
 
 # ============================================================
 # Environment / configuration
@@ -95,6 +97,11 @@ user_last_balances = {}
 user_states = {}
 active_password_rotations = set()
 state_lock = threading.RLock()
+generator_cache_lock = threading.RLock()
+generator_session_cache = {}
+number_search_lock = threading.RLock()
+number_search_jobs = {}
+user_last_balance_texts = {}
 
 # ============================================================
 # Persistent bot settings
@@ -145,16 +152,99 @@ if not isinstance(BOT_STATE.get("users"), dict):
 # Temporary email + five-profile storage
 # ============================================================
 
+
+def _normalize_profile(profile, number):
+    profile = profile if isinstance(profile, dict) else {}
+    profile["number"] = int(number)
+    profile["pin"] = str(profile.get("pin") or DEFAULT_PROFILE_PINS[int(number)])
+    status = str(profile.get("status") or "available")
+    if status not in {"available", "review", "sold"}:
+        status = "available"
+    profile["status"] = status
+    profile["sold_at"] = profile.get("sold_at") if status == "sold" else None
+    return profile
+
+
+def _normalize_managed_email(item):
+    item = item if isinstance(item, dict) else {}
+    now = time.time()
+    address = normalize_email(str(item.get("address") or item.get("email") or ""))
+    item["address"] = address
+    if not item.get("id"):
+        seed = f"{address}|{item.get('created_at', now)}".encode("utf-8", errors="ignore")
+        item["id"] = "m" + hashlib.sha1(seed).hexdigest()[:16]
+    try:
+        created_at = float(item.get("created_at", now))
+    except (TypeError, ValueError):
+        created_at = now
+    item["created_at"] = created_at
+    try:
+        expires_at = float(item.get("expires_at", created_at + EMAIL_LIFETIME_SECONDS))
+    except (TypeError, ValueError):
+        expires_at = created_at + EMAIL_LIFETIME_SECONDS
+    item["expires_at"] = expires_at
+    item["mode"] = str(item.get("mode") or "random")
+
+    existing = {}
+    for p in item.get("profiles", []) if isinstance(item.get("profiles"), list) else []:
+        try:
+            number = int(p.get("number"))
+        except Exception:
+            continue
+        if 1 <= number <= 5:
+            existing[number] = p
+    item["profiles"] = [_normalize_profile(existing.get(i), i) for i in range(1, 6)]
+    item["status"] = "completed" if all(p["status"] == "sold" for p in item["profiles"]) else "active"
+
+    seen = item.get("seen")
+    if not isinstance(seen, list):
+        seen = item.get("generatorSeenIds") if isinstance(item.get("generatorSeenIds"), list) else []
+    item["seen"] = [str(x) for x in seen if x][-200:]
+    if not isinstance(item.get("message_times"), dict):
+        item["message_times"] = {}
+    try:
+        item["auto_until"] = float(item.get("auto_until", created_at + AUTO_MAIL_WINDOW_SECONDS))
+    except (TypeError, ValueError):
+        item["auto_until"] = created_at + AUTO_MAIL_WINDOW_SECONDS
+    try:
+        item["auto_count"] = max(0, int(item.get("auto_count", 0)))
+    except (TypeError, ValueError):
+        item["auto_count"] = 0
+    return item
+
+
 def temp_user_state(user_id):
-    """Return persistent email state for one Telegram user."""
+    """Return persistent email state for one Telegram user and migrate old state safely."""
     key = str(user_id)
+    changed = False
     with state_lock:
         users = BOT_STATE.setdefault("users", {})
         if key not in users or not isinstance(users[key], dict):
             users[key] = {"emails": [], "selected": None}
-        users[key].setdefault("emails", [])
-        users[key].setdefault("selected", None)
-        return users[key]
+            changed = True
+        data = users[key]
+        if not isinstance(data.get("emails"), list):
+            data["emails"] = []
+            changed = True
+        normalized = []
+        for raw in data["emails"]:
+            if not isinstance(raw, dict):
+                changed = True
+                continue
+            item = _normalize_managed_email(raw)
+            if item.get("address"):
+                normalized.append(item)
+        if normalized != data["emails"]:
+            data["emails"] = normalized
+            changed = True
+        ids = {x.get("id") for x in data["emails"]}
+        if data.get("selected") not in ids:
+            data["selected"] = data["emails"][0]["id"] if data["emails"] else None
+            changed = True
+    if changed:
+        save_state(BOT_STATE)
+    return data
+
 
 
 def make_profile(profile_number):
@@ -166,6 +256,7 @@ def make_profile(profile_number):
     }
 
 
+
 def make_managed_email(address, mode="random"):
     now = time.time()
     return {
@@ -173,7 +264,7 @@ def make_managed_email(address, mode="random"):
         "address": normalize_email(address),
         "created_at": now,
         "expires_at": now + EMAIL_LIFETIME_SECONDS,
-        "status": "active",  # active | completed
+        "status": "active",
         "mode": mode,
         "profiles": [make_profile(i) for i in range(1, 6)],
         "seen": [],
@@ -183,27 +274,37 @@ def make_managed_email(address, mode="random"):
     }
 
 
+
+
 def get_managed_email(user_id, email_id=None):
     data = temp_user_state(user_id)
     email_id = email_id or data.get("selected")
     if not email_id:
         return None
-    return next((x for x in data.get("emails", []) if x.get("id") == email_id), None)
+    with state_lock:
+        item = next((x for x in data.get("emails", []) if x.get("id") == email_id), None)
+        return _normalize_managed_email(item) if item else None
+
+
 
 
 def add_managed_email(user_id, address, mode="random"):
     address = normalize_email(address)
     data = temp_user_state(user_id)
-    old_email = next((x for x in data["emails"] if x.get("address") == address), None)
-    if old_email:
-        data["selected"] = old_email["id"]
-        save_state(BOT_STATE)
-        return old_email, False
-    item = make_managed_email(address, mode)
-    data["emails"].insert(0, item)
-    data["selected"] = item["id"]
+    with state_lock:
+        old_email = next((x for x in data["emails"] if x.get("address") == address), None)
+        if old_email:
+            data["selected"] = old_email["id"]
+            item = old_email
+            created = False
+        else:
+            item = make_managed_email(address, mode)
+            data["emails"].insert(0, item)
+            data["selected"] = item["id"]
+            created = True
     save_state(BOT_STATE)
-    return item, True
+    return item, created
+
 
 
 def make_temp_mail_name():
@@ -214,10 +315,17 @@ def make_temp_mail_name():
             return name
 
 
+
 def normalize_mail_text(value):
     value = html.unescape(value or "")
     value = re.sub(r"[\u200b-\u200f\u202a-\u202e\u2060\ufeff\xad]", "", value)
-    return "\n".join(line.strip() for line in value.splitlines() if line.strip())
+    lines = []
+    for raw in value.splitlines():
+        line = re.sub(r"[\t\u00a0 ]+", " ", raw).strip()
+        if line:
+            lines.append(line)
+    return "\n".join(lines)
+
 
 
 def extract_verification_code(value):
@@ -252,50 +360,56 @@ def important_message_url(urls):
     return candidates[0] if candidates else None
 
 
-def fetch_temp_mailbox(address):
-    """Read generator.email using the same server-side pattern that worked before."""
-    address = normalize_email(address)
-    if "@" not in address:
-        return []
-    username, domain = address.split("@", 1)
-    session = requests.Session()
-    headers = {
+
+def _generator_headers():
+    return {
         "User-Agent": (
             "Mozilla/5.0 (Linux; Android 14; Mobile) "
             "AppleWebKit/537.36 Chrome/136.0 Mobile Safari/537.36"
-        )
+        ),
+        "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
     }
 
-    # Bootstrap a Generator.email session/cookies first, then open inbox9/address.
-    try:
-        session.get(
-            f"{GENERATOR_BASE_URL.rstrip('/')}/{domain}/{username}",
-            headers=headers,
-            timeout=15,
-            allow_redirects=True,
-        )
-    except Exception:
-        pass
 
-    response = session.get(
-        f"{GENERATOR_BASE_URL.rstrip('/')}/{GENERATOR_INBOX}/{address}",
-        headers=headers,
-        timeout=20,
-        allow_redirects=True,
-    )
-    response.raise_for_status()
-    soup = BeautifulSoup(response.text, "html.parser")
+def _cached_generator_session(address):
+    address = normalize_email(address)
+    with generator_cache_lock:
+        entry = generator_session_cache.get(address)
+        if entry is None:
+            session = requests.Session()
+            session.headers.update(_generator_headers())
+            entry = {"session": session, "lock": threading.RLock(), "bootstrapped": False, "used": time.time()}
+            generator_session_cache[address] = entry
+        entry["used"] = time.time()
+        # Prevent unbounded cache growth.
+        if len(generator_session_cache) > 100:
+            stale = sorted(generator_session_cache.items(), key=lambda kv: kv[1].get("used", 0))[:-80]
+            for key, old in stale:
+                try:
+                    old["session"].close()
+                except Exception:
+                    pass
+                generator_session_cache.pop(key, None)
+        return entry
+
+
+def _parse_generator_messages(page_html):
+    soup = BeautifulSoup(page_html or "", "html.parser")
     table = soup.find("div", id="email-table")
     if not table:
         return []
 
-    senders = table.find_all("div", class_="from_div_45g45gg")
-    subjects = table.find_all("div", class_="subj_div_45g45gg")
+    senders = [
+        n for n in table.find_all("div", class_="from_div_45g45gg")
+        if n.get_text(" ", strip=True).strip().lower() not in {"from", "المرسل"}
+    ]
+    subjects = [
+        n for n in table.find_all("div", class_="subj_div_45g45gg")
+        if n.get_text(" ", strip=True).strip().lower() not in {"subject", "العنوان"}
+    ]
     bodies = table.find_all("div", class_="mess_bodiyy")
-
-    # Generator.email may include literal table headings in these same classes.
-    senders = [n for n in senders if n.get_text(" ", strip=True).lower() != "from"]
-    subjects = [n for n in subjects if n.get_text(" ", strip=True).lower() != "subject"]
 
     count = max(len(senders), len(subjects), len(bodies))
     messages = []
@@ -307,27 +421,76 @@ def fetch_temp_mailbox(address):
         if i < len(bodies):
             body_copy = BeautifulSoup(str(bodies[i]), "html.parser")
             for tag in body_copy.find_all("a", href=True):
-                href = (tag.get("href") or "").strip()
+                href = html.unescape((tag.get("href") or "").strip())
                 if href.startswith(("http://", "https://")):
                     urls.append(href)
                     title = tag.get_text(" ", strip=True)
                     tag.replace_with(f"\n{title}\n{href}\n" if title else f"\n{href}\n")
             body = normalize_mail_text(body_copy.get_text("\n", strip=True))
 
-        urls = list(dict.fromkeys(urls + extract_urls(body)))
-        digest_source = f"{sender}|{subject}|{body[:1200]}".encode("utf-8", errors="ignore")
-        message_id = hashlib.sha1(digest_source).hexdigest()
+        urls = list(dict.fromkeys([u for u in urls + extract_urls(body) if u]))
+        visible_for_code = re.sub(r"https?://\S+", " ", subject + "\n" + body, flags=re.I)
+        digest_source = f"{sender}|{subject}|{body[:2000]}".encode("utf-8", errors="ignore")
         messages.append(
             {
-                "id": message_id,
-                "from": sender,
-                "subject": subject,
+                "id": hashlib.sha1(digest_source).hexdigest(),
+                "from": sender or "غير معروف",
+                "subject": subject or "بدون عنوان",
                 "body": body,
                 "urls": urls,
-                "code": extract_verification_code(subject + "\n" + body),
+                "code": extract_verification_code(visible_for_code),
             }
         )
-    return messages[:20]
+    # Preserve source ordering but drop exact duplicate message ids.
+    unique = []
+    seen_ids = set()
+    for msg in messages:
+        if msg["id"] in seen_ids:
+            continue
+        seen_ids.add(msg["id"])
+        unique.append(msg)
+    return unique[:30]
+
+
+
+def fetch_temp_mailbox(address):
+    """Read generator.email quickly with a persistent cookie/session per mailbox."""
+    address = normalize_email(address)
+    if "@" not in address:
+        return []
+    username, domain = address.split("@", 1)
+    base = GENERATOR_BASE_URL.rstrip("/")
+    entry = _cached_generator_session(address)
+    with entry["lock"]:
+        session = entry["session"]
+        if not entry.get("bootstrapped"):
+            try:
+                session.get(f"{base}/{domain}/{username}", timeout=12, allow_redirects=True)
+            except Exception:
+                try:
+                    session.get(base, timeout=10, allow_redirects=True)
+                except Exception:
+                    pass
+            entry["bootstrapped"] = True
+
+        urls_to_try = [
+            f"{base}/{GENERATOR_INBOX}/{address}",
+            f"{base}/{domain}/{username}",
+        ]
+        last_error = None
+        for mailbox_url in urls_to_try:
+            try:
+                response = session.get(mailbox_url, timeout=15, allow_redirects=True)
+                response.raise_for_status()
+                messages = _parse_generator_messages(response.text)
+                if messages or 'id="email-table"' in response.text or "id='email-table'" in response.text:
+                    return messages
+            except Exception as exc:
+                last_error = exc
+        if last_error:
+            raise last_error
+        return []
+
 
 
 def relative_time(timestamp):
@@ -377,13 +540,15 @@ def managed_email_summary(item):
     )
 
 
+
 def managed_email_keyboard(item):
     markup = InlineKeyboardMarkup(row_width=2)
-    # Telegram clients that support CopyTextButton show native copy behavior.
-    try:
-        markup.add(InlineKeyboardButton("📋 نسخ الإيميل", copy_text={"text": item["address"]}))
-    except TypeError:
-        markup.add(InlineKeyboardButton("📋 الإيميل", callback_data=f"show_email:{item['id']}"))
+    markup.add(
+        InlineKeyboardButton(
+            "📋 نسخ الإيميل",
+            copy_text=CopyTextButton(text=str(item["address"])[:256]),
+        )
+    )
     markup.add(
         InlineKeyboardButton(
             "📬 فتح صندوق الإيميل",
@@ -398,6 +563,7 @@ def managed_email_keyboard(item):
     markup.add(InlineKeyboardButton("🗑️ حذف الإيميل", callback_data=f"email_delete:{item['id']}"))
     markup.add(InlineKeyboardButton("🔙 الإيميلات", callback_data="emails_list"))
     return markup
+
 
 
 def profiles_keyboard(item):
@@ -415,18 +581,21 @@ def profiles_keyboard(item):
     return markup
 
 
+
 def profile_keyboard(item, profile):
     markup = InlineKeyboardMarkup(row_width=2)
-    try:
-        markup.add(
-            InlineKeyboardButton(
-                f"📋 نسخ الرمز {profile['pin']}",
-                copy_text={"text": str(profile["pin"])},
-            )
+    markup.add(
+        InlineKeyboardButton(
+            f"📋 نسخ الرمز {profile['pin']}",
+            copy_text=CopyTextButton(text=str(profile["pin"])[:256]),
         )
-        markup.add(InlineKeyboardButton("📧 نسخ الإيميل", copy_text={"text": item["address"]}))
-    except TypeError:
-        pass
+    )
+    markup.add(
+        InlineKeyboardButton(
+            "📧 نسخ الإيميل",
+            copy_text=CopyTextButton(text=str(item["address"])[:256]),
+        )
+    )
     markup.add(
         InlineKeyboardButton(
             "🔎 جلب الكود أو الرابط",
@@ -459,6 +628,7 @@ def profile_keyboard(item, profile):
     return markup
 
 
+
 def format_auto_mail(item, message):
     lines = [
         "🔔 وصلت رسالة جديدة",
@@ -478,86 +648,176 @@ def format_auto_mail(item, message):
     return "\n".join(lines)
 
 
-def background_temp_mail_monitor():
-    """Send only first five new messages during first 20 minutes for each email."""
-    while True:
-        time.sleep(max(1.0, AUTO_MAIL_POLL_SECONDS))
-        changed = False
-        users_snapshot = list(BOT_STATE.get("users", {}).items())
-        for user_id_text, data in users_snapshot:
-            try:
-                user_id = int(user_id_text)
-            except (TypeError, ValueError):
+
+def _deliver_auto_mail(user_id, item_id, messages):
+    """Apply one mailbox poll result under the state lock and send only eligible new mail."""
+    for message in reversed(messages[:10]):
+        with state_lock:
+            item = get_managed_email(user_id, item_id)
+            if not item:
+                return False
+            now = time.time()
+            if item.get("status") == "completed":
+                return False
+            if now > float(item.get("auto_until", 0)):
+                return False
+            if int(item.get("auto_count", 0)) >= AUTO_MAIL_MAX_MESSAGES:
+                return False
+            mid = message.get("id")
+            if not mid or mid in item.setdefault("seen", []):
                 continue
-            for item in list(data.get("emails", [])):
-                if item.get("status") == "completed":
-                    continue
-                if time.time() > float(item.get("auto_until", 0)):
-                    continue
-                if int(item.get("auto_count", 0)) >= AUTO_MAIL_MAX_MESSAGES:
-                    continue
+
+        keyboard = InlineKeyboardMarkup()
+        if message.get("code"):
+            keyboard.add(
+                InlineKeyboardButton(
+                    f"📋 نسخ الكود {message['code']}",
+                    copy_text=CopyTextButton(text=str(message["code"])[:256]),
+                )
+            )
+        else:
+            link = important_message_url(message.get("urls", []))
+            if link:
+                keyboard.add(InlineKeyboardButton("🔗 فتح الرابط", url=link))
+        try:
+            bot.send_message(user_id, format_auto_mail(item, message), reply_markup=keyboard)
+        except Exception as exc:
+            print(f"auto mail send failed: {type(exc).__name__}")
+            # Do not mark it seen; a later poll can retry.
+            continue
+
+        with state_lock:
+            current = get_managed_email(user_id, item_id)
+            if not current:
+                return True
+            if mid not in current.setdefault("seen", []):
+                current["seen"].append(mid)
+                current["seen"] = current["seen"][-200:]
+            message_discovered_at(current, message)
+            current["auto_count"] = min(
+                AUTO_MAIL_MAX_MESSAGES,
+                int(current.get("auto_count", 0)) + 1,
+            )
+        save_state(BOT_STATE)
+    return True
+
+
+def background_temp_mail_monitor():
+    """Poll active mailboxes concurrently; first 5 messages only during first 20 minutes."""
+    workers = max(1, min(8, int(os.getenv("AUTO_MAIL_WORKERS", "6"))))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="mailpoll") as pool:
+        while True:
+            time.sleep(max(1.0, AUTO_MAIL_POLL_SECONDS))
+            now = time.time()
+            jobs = []
+            with state_lock:
+                for user_id_text, data in list(BOT_STATE.get("users", {}).items()):
+                    try:
+                        user_id = int(user_id_text)
+                    except (TypeError, ValueError):
+                        continue
+                    for item in list(data.get("emails", [])):
+                        if item.get("status") == "completed":
+                            continue
+                        if now > float(item.get("auto_until", 0)):
+                            continue
+                        if int(item.get("auto_count", 0)) >= AUTO_MAIL_MAX_MESSAGES:
+                            continue
+                        if not item.get("address") or not item.get("id"):
+                            continue
+                        jobs.append((user_id, item["id"], item["address"]))
+
+            futures = {
+                pool.submit(fetch_temp_mailbox, address): (user_id, item_id)
+                for user_id, item_id, address in jobs
+            }
+            for future in as_completed(futures):
+                user_id, item_id = futures[future]
                 try:
-                    messages = fetch_temp_mailbox(item["address"])
+                    messages = future.result()
                 except Exception:
                     continue
-
-                # Oldest unseen first, so multiple arrivals are delivered in order.
-                for message in reversed(messages[:10]):
-                    mid = message.get("id")
-                    if not mid or mid in item.setdefault("seen", []):
-                        continue
-                    item["seen"].append(mid)
-                    item["seen"] = item["seen"][-100:]
-                    discovered = message_discovered_at(item, message)
-                    changed = True
-                    if time.time() <= item.get("auto_until", 0) and item.get("auto_count", 0) < AUTO_MAIL_MAX_MESSAGES:
-                        try:
-                            keyboard = InlineKeyboardMarkup()
-                            if message.get("code"):
-                                try:
-                                    keyboard.add(
-                                        InlineKeyboardButton(
-                                            f"📋 نسخ الكود {message['code']}",
-                                            copy_text={"text": str(message["code"])},
-                                        )
-                                    )
-                                except TypeError:
-                                    pass
-                            else:
-                                link = important_message_url(message.get("urls", []))
-                                if link:
-                                    keyboard.add(InlineKeyboardButton("🔗 فتح الرابط", url=link))
-                            bot.send_message(user_id, format_auto_mail(item, message), reply_markup=keyboard)
-                        except Exception:
-                            pass
-                        item["auto_count"] = int(item.get("auto_count", 0)) + 1
-                        if item["auto_count"] >= AUTO_MAIL_MAX_MESSAGES:
-                            break
-        if changed:
-            save_state(BOT_STATE)
+                _deliver_auto_mail(user_id, item_id, messages)
 
 
-def cleanup_expired_emails():
+
+
+def cleanup_expired_emails(run_once=False):
     while True:
-        time.sleep(300)
         now = time.time()
         changed = False
-        for data in BOT_STATE.get("users", {}).values():
-            emails = data.get("emails", [])
-            old_count = len(emails)
-            data["emails"] = [x for x in emails if float(x.get("expires_at", 0)) > now]
-            if len(data["emails"]) != old_count:
-                changed = True
-            selected = data.get("selected")
-            if selected and not any(x.get("id") == selected for x in data["emails"]):
-                data["selected"] = data["emails"][0]["id"] if data["emails"] else None
-                changed = True
+        with state_lock:
+            for data in BOT_STATE.get("users", {}).values():
+                emails = data.get("emails", []) if isinstance(data, dict) else []
+                old_count = len(emails)
+                kept = []
+                for x in emails:
+                    if not isinstance(x, dict):
+                        changed = True
+                        continue
+                    try:
+                        expires = float(x.get("expires_at", 0) or 0)
+                    except (TypeError, ValueError):
+                        expires = 0
+                    if expires > now:
+                        kept.append(x)
+                data["emails"] = kept
+                if len(data["emails"]) != old_count:
+                    changed = True
+                selected = data.get("selected")
+                if selected and not any(x.get("id") == selected for x in data["emails"]):
+                    data["selected"] = data["emails"][0]["id"] if data["emails"] else None
+                    changed = True
         if changed:
             save_state(BOT_STATE)
+        if run_once:
+            return
+        time.sleep(300)
+
 
 # ============================================================
 # Utilities
 # ============================================================
+
+
+def safe_answer_callback(call, text=None, show_alert=False):
+    try:
+        bot.answer_callback_query(call.id, text=text, show_alert=show_alert)
+    except Exception:
+        pass
+
+
+def safe_edit_message(chat_id, message_id, text, reply_markup=None, parse_mode=None):
+    try:
+        return bot.edit_message_text(
+            text,
+            chat_id,
+            message_id,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode,
+        )
+    except Exception:
+        try:
+            return bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode=parse_mode)
+        except Exception:
+            return None
+
+
+def back_to_main_keyboard():
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="main_menu"))
+    return markup
+
+
+def _parse_email_profile_callback(data, expected_parts):
+    try:
+        parts = data.split(":")
+        if len(parts) != expected_parts:
+            return None
+        return parts
+    except Exception:
+        return None
+
 
 def get_user_data(user_id):
     return USERS.get(user_id)
@@ -665,27 +925,31 @@ def get_current_balance(api_key):
     return 0.0, "غير معروف"
 
 
+
 def balance_monitor():
     while True:
-        time.sleep(30)
-        for user_id, user_info in USERS.items():
-            api_key = user_info["api_key"]
-            num_val, text_val = get_current_balance(api_key)
-            if user_id not in user_last_balances:
-                user_last_balances[user_id] = num_val
+        for user_id, user_info in list(USERS.items()):
+            api_key = user_info.get("api_key", "")
+            if not api_key:
                 continue
-            if num_val > user_last_balances[user_id]:
+            num_val, text_val = get_current_balance(api_key)
+            old = user_last_balances.get(user_id)
+            user_last_balance_texts[user_id] = text_val
+            if old is None:
                 user_last_balances[user_id] = num_val
-                try:
-                    bot.send_message(
-                        user_id,
-                        f"🎉 **تم استلام الأموال بنجاح!**\n💰 رصيدك الحالي أصبح: **{text_val}**",
-                        parse_mode="Markdown",
-                    )
-                except Exception:
-                    pass
-            elif num_val < user_last_balances[user_id]:
+            elif num_val != old:
                 user_last_balances[user_id] = num_val
+                if num_val > old:
+                    try:
+                        bot.send_message(
+                            user_id,
+                            f"🎉 **تم استلام الأموال بنجاح!**\n💰 رصيدك الحالي أصبح: **{text_val}**",
+                            parse_mode="Markdown",
+                        )
+                    except Exception:
+                        pass
+        time.sleep(30)
+
 
 
 def cancel_order(api_key, activation_id):
@@ -701,27 +965,43 @@ def cancel_order(api_key, activation_id):
         pass
 
 
+
 def check_for_sms(chat_id, api_key, activation_id, phone_number):
     start_time = time.time()
+    consecutive_errors = 0
     while time.time() - start_time < 600:
         time.sleep(5)
-        if chat_id not in user_active_orders or user_active_orders[chat_id] != activation_id:
-            break
+        if user_active_orders.get(chat_id) != activation_id:
+            return
         try:
             params = {"api_key": api_key, "action": "getStatus", "id": activation_id}
             response = requests.get(BASE_URL, params=params, timeout=10)
+            response.raise_for_status()
             res = response.text.strip()
+            consecutive_errors = 0
             if res.startswith("STATUS_OK:"):
                 code = res.split(":", 1)[1]
                 user_active_orders.pop(chat_id, None)
                 bot.send_message(chat_id, code)
-                break
+                return
             if res == "STATUS_CANCEL":
                 user_active_orders.pop(chat_id, None)
                 bot.send_message(chat_id, "❌ تم إلغاء العملية من قبل الموقع.")
-                break
+                return
         except Exception:
-            break
+            consecutive_errors += 1
+            if consecutive_errors >= 6:
+                try:
+                    bot.send_message(chat_id, "⚠️ تعذر فحص كود الرسالة مؤقتاً. أعد المحاولة بعد قليل.")
+                except Exception:
+                    pass
+                return
+    if user_active_orders.get(chat_id) == activation_id:
+        try:
+            bot.send_message(chat_id, "⌛ انتهت مدة انتظار الكود. يمكنك إلغاء الرقم أو شراء رقم جديد.")
+        except Exception:
+            pass
+
 
 # ============================================================
 # Mail readers
@@ -770,10 +1050,11 @@ def message_text_and_urls(msg):
     return "\n".join(chunks), unique_urls
 
 
-def wait_reset_link_imap(target_email, since_ts):
+
+def wait_reset_link_imap(target_email, since_ts, exclude_urls=None):
     if not all([IMAP_HOST, IMAP_USER, IMAP_PASSWORD]):
         raise RuntimeError("IMAP configuration is incomplete")
-
+    exclude_urls = set(exclude_urls or ())
     deadline = time.time() + RESET_MAIL_TIMEOUT
     while time.time() < deadline:
         mail = None
@@ -781,41 +1062,39 @@ def wait_reset_link_imap(target_email, since_ts):
             mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, timeout=20)
             mail.login(IMAP_USER, IMAP_PASSWORD)
             mail.select(IMAP_FOLDER)
-
-            # Search recent messages. We validate recipient + Netflix URL ourselves.
             status, data = mail.search(None, "ALL")
             if status != "OK":
                 raise RuntimeError("IMAP search failed")
-            ids = data[0].split()[-40:]
-
+            ids = data[0].split()[-60:]
             for msg_id in reversed(ids):
-                status, payload = mail.fetch(msg_id, "(RFC822 INTERNALDATE)")
+                status, payload = mail.fetch(msg_id, "(RFC822)")
                 if status != "OK" or not payload:
                     continue
-
-                raw_bytes = None
-                for item in payload:
-                    if isinstance(item, tuple) and isinstance(item[1], bytes):
-                        raw_bytes = item[1]
-                        break
+                raw_bytes = next(
+                    (item[1] for item in payload if isinstance(item, tuple) and isinstance(item[1], bytes)),
+                    None,
+                )
                 if not raw_bytes:
                     continue
-
                 msg = email.message_from_bytes(raw_bytes)
+                try:
+                    msg_dt = parsedate_to_datetime(msg.get("Date")) if msg.get("Date") else None
+                    if msg_dt is not None and msg_dt.timestamp() < since_ts - 90:
+                        continue
+                except Exception:
+                    pass
                 to_header = " ".join(
                     filter(None, [msg.get("To"), msg.get("Delivered-To"), msg.get("X-Original-To")])
                 ).lower()
                 subject = decode_mime_header(msg.get("Subject", "")).lower()
                 sender = decode_mime_header(msg.get("From", "")).lower()
-
                 body, urls = message_text_and_urls(msg)
-                combined = (to_header + "\n" + body.lower())
+                combined = to_header + "\n" + body.lower()
                 if target_email.lower() not in combined and target_email.lower() not in to_header:
                     continue
                 if "netflix" not in sender and "netflix" not in subject and "netflix" not in body.lower():
                     continue
-
-                chosen = choose_reset_url(urls)
+                chosen = choose_reset_url([u for u in urls if u not in exclude_urls])
                 if chosen:
                     return chosen
         except Exception as exc:
@@ -826,91 +1105,84 @@ def wait_reset_link_imap(target_email, since_ts):
                     mail.logout()
                 except Exception:
                     pass
-
-        time.sleep(RESET_MAIL_POLL)
-
+        time.sleep(max(1.0, RESET_MAIL_POLL))
     raise TimeoutError("reset email timeout")
+
+
 
 
 def generator_session():
     session = requests.Session()
-    session.headers.update(
-        {
-            "User-Agent": (
-                "Mozilla/5.0 (Linux; Android 14; Mobile) "
-                "AppleWebKit/537.36 Chrome/136.0 Mobile Safari/537.36"
-            ),
-            "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
-        }
-    )
+    session.headers.update(_generator_headers())
     try:
-        session.get(GENERATOR_BASE_URL, timeout=20)
+        session.get(GENERATOR_BASE_URL.rstrip("/"), timeout=15, allow_redirects=True)
     except Exception:
         pass
     return session
 
 
+
+
 def generator_read_messages(session, target_email):
+    target_email = normalize_email(target_email)
     local, domain = target_email.split("@", 1)
+    base = GENERATOR_BASE_URL.rstrip("/")
     urls_to_try = [
-        f"{GENERATOR_BASE_URL}/{GENERATOR_INBOX}/{target_email}",
-        f"{GENERATOR_BASE_URL}/{domain}/{local}",
+        f"{base}/{GENERATOR_INBOX}/{target_email}",
+        f"{base}/{domain}/{local}",
     ]
-
     for mailbox_url in urls_to_try:
-        response = session.get(mailbox_url, timeout=20, allow_redirects=True)
+        response = session.get(mailbox_url, timeout=15, allow_redirects=True)
         response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
-        table = soup.find("div", id="email-table")
-        if not table:
-            continue
-
-        bodies = table.find_all("div", class_="mess_bodiyy")
-        senders = table.find_all("div", class_="from_div_45g45gg")
-        subjects = table.find_all("div", class_="subj_div_45g45gg")
-        out = []
-
-        count = max(len(bodies), len(senders), len(subjects))
-        for i in range(count):
-            sender = senders[i].get_text(" ", strip=True) if i < len(senders) else ""
-            subject = subjects[i].get_text(" ", strip=True) if i < len(subjects) else ""
-            body = bodies[i] if i < len(bodies) else None
-            links = []
-            text = ""
-            if body:
-                body_copy = BeautifulSoup(str(body), "html.parser")
-                for a in body_copy.find_all("a", href=True):
-                    links.append(a["href"].strip())
-                text = body_copy.get_text("\n", strip=True)
-                links.extend(extract_urls(str(body_copy)))
-            out.append({"sender": sender, "subject": subject, "text": text, "urls": links})
-        return out
+        parsed = _parse_generator_messages(response.text)
+        if parsed or 'id="email-table"' in response.text or "id='email-table'" in response.text:
+            return [
+                {
+                    "id": item["id"],
+                    "sender": item["from"],
+                    "subject": item["subject"],
+                    "text": item["body"],
+                    "urls": item["urls"],
+                }
+                for item in parsed
+            ]
     return []
 
 
-def wait_reset_link_generator(target_email, since_ts):
-    session = generator_session()
+
+
+def wait_reset_link_generator(target_email, since_ts, exclude_urls=None, session=None):
+    session = session or generator_session()
+    exclude_urls = set(exclude_urls or ())
     deadline = time.time() + RESET_MAIL_TIMEOUT
     while time.time() < deadline:
         try:
             messages = generator_read_messages(session, target_email)
-            for item in messages[:10]:
+            for item in messages[:15]:
                 hay = f"{item['sender']}\n{item['subject']}\n{item['text']}".lower()
                 if "netflix" not in hay:
                     continue
-                chosen = choose_reset_url(item["urls"])
+                chosen = choose_reset_url([u for u in item["urls"] if u not in exclude_urls])
                 if chosen:
                     return chosen
         except Exception as exc:
             print(f"generator poll failed: {type(exc).__name__}")
-        time.sleep(RESET_MAIL_POLL)
+        time.sleep(max(1.0, RESET_MAIL_POLL))
     raise TimeoutError("reset email timeout")
 
 
-def wait_for_reset_link(target_email, since_ts):
+
+
+def wait_for_reset_link(target_email, since_ts, exclude_urls=None, generator_mail_session=None):
     if MAIL_MODE == "generator":
-        return wait_reset_link_generator(target_email, since_ts)
-    return wait_reset_link_imap(target_email, since_ts)
+        return wait_reset_link_generator(
+            target_email,
+            since_ts,
+            exclude_urls=exclude_urls,
+            session=generator_mail_session,
+        )
+    return wait_reset_link_imap(target_email, since_ts, exclude_urls=exclude_urls)
+
 
 # ============================================================
 # Netflix browser automation
@@ -926,12 +1198,39 @@ def first_visible(locator_candidates):
     return None
 
 
+
 def fill_login_help_email(page, account_email):
+    # Dismiss common cookie banner when it blocks the form.
+    for candidate in [
+        page.get_by_role("button", name=re.compile(r"accept|agree|قبول|موافق", re.I)),
+        page.locator('button[data-uia*="cookie" i]'),
+    ]:
+        try:
+            if candidate.count() and candidate.first.is_visible():
+                candidate.first.click(timeout=2000)
+                break
+        except Exception:
+            pass
+
+    # Some layouts require choosing Email before the input is shown.
+    for candidate in [
+        page.get_by_role("radio", name=re.compile(r"email|البريد", re.I)),
+        page.locator('input[type="radio"][value*="email" i]'),
+    ]:
+        try:
+            if candidate.count() and candidate.first.is_visible() and not candidate.first.is_checked():
+                candidate.first.check(force=True)
+                page.wait_for_timeout(300)
+                break
+        except Exception:
+            pass
+
     field = first_visible(
         [
             page.locator('input[type="email"]'),
             page.locator('input[name="email"]'),
             page.locator('input[id*="email" i]'),
+            page.locator('input[autocomplete="email"]'),
         ]
     )
     if not field:
@@ -940,7 +1239,7 @@ def fill_login_help_email(page, account_email):
 
     button = first_visible(
         [
-            page.get_by_role("button", name=re.compile(r"email|send|إرسال|البريد", re.I)),
+            page.get_by_role("button", name=re.compile(r"email|send|إرسال|البريد|text me|رسالة", re.I)),
             page.locator('button[type="submit"]'),
             page.locator('input[type="submit"]'),
         ]
@@ -950,29 +1249,33 @@ def fill_login_help_email(page, account_email):
     button.click()
 
 
+
+
 def fill_new_password_form(page, new_password, sign_out_all):
     page.wait_for_load_state("domcontentloaded")
-
-    password_fields = page.locator('input[type="password"]')
-    count = password_fields.count()
-    if count < 2:
-        # Some Netflix layouts render inputs slightly later.
-        page.wait_for_timeout(1500)
-        count = password_fields.count()
-    if count < 2:
+    for _ in range(3):
+        visible_passwords = [
+            page.locator('input[type="password"]').nth(i)
+            for i in range(page.locator('input[type="password"]').count())
+            if page.locator('input[type="password"]').nth(i).is_visible()
+        ]
+        if len(visible_passwords) >= 2:
+            break
+        page.wait_for_timeout(700)
+    if len(visible_passwords) < 2:
         raise RuntimeError("password fields not found")
 
-    password_fields.nth(0).fill(new_password)
-    password_fields.nth(1).fill(new_password)
+    visible_passwords[0].fill(new_password)
+    visible_passwords[1].fill(new_password)
 
-    # Prefer label-based checkbox; fall back to a single checkbox on the form.
     checkbox = first_visible(
         [
             page.get_by_role(
                 "checkbox",
                 name=re.compile(r"sign out|all devices|تسجيل الخروج|جميع الأجهزة", re.I),
             ),
-            page.locator('input[type="checkbox"]'),
+            page.locator('input[type="checkbox"][name*="sign" i]'),
+            page.locator('input[type="checkbox"][id*="sign" i]'),
         ]
     )
     if checkbox:
@@ -987,7 +1290,7 @@ def fill_new_password_form(page, new_password, sign_out_all):
 
     save_button = first_visible(
         [
-            page.get_by_role("button", name=re.compile(r"save|حفظ|continue|متابعة", re.I)),
+            page.get_by_role("button", name=re.compile(r"save|حفظ|continue|متابعة|submit|إرسال", re.I)),
             page.locator('button[type="submit"]'),
             page.locator('input[type="submit"]'),
         ]
@@ -1000,42 +1303,73 @@ def fill_new_password_form(page, new_password, sign_out_all):
         page.wait_for_load_state("networkidle", timeout=15000)
     except PlaywrightTimeoutError:
         pass
-
-    # A conservative completion check: password form must disappear.
     page.wait_for_timeout(1200)
-    if page.locator('input[type="password"]').count() >= 2:
+    remaining = page.locator('input[type="password"]')
+    visible_remaining = 0
+    for i in range(remaining.count()):
+        try:
+            visible_remaining += 1 if remaining.nth(i).is_visible() else 0
+        except Exception:
+            pass
+    if visible_remaining >= 2:
         raise RuntimeError("password form still present")
 
 
+
+
 def rotate_netflix_password(account_email, new_password, sign_out_all):
-    reset_requested_at = time.time()
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
-        )
-        context = browser.new_context(
-            locale="ar-IQ",
-            viewport={"width": 1280, "height": 900},
-        )
-        page = context.new_page()
-        page.set_default_timeout(20000)
-
+    generator_mail_session = None
+    exclude_urls = set()
+    if MAIL_MODE == "generator":
+        generator_mail_session = generator_session()
         try:
+            for old in generator_read_messages(generator_mail_session, account_email)[:20]:
+                exclude_urls.update(u for u in old.get("urls", []) if is_netflix_reset_url(u))
+        except Exception:
+            pass
+
+    reset_requested_at = time.time()
+    with sync_playwright() as p:
+        browser = None
+        context = None
+        try:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            context = browser.new_context(locale="ar-IQ", viewport={"width": 1280, "height": 900})
+            page = context.new_page()
+            page.set_default_timeout(20000)
             page.goto(NETFLIX_LOGIN_HELP_URL, wait_until="domcontentloaded", timeout=30000)
             fill_login_help_email(page, account_email)
 
-            # Mail waiting happens after the reset request has been sent.
-            reset_url = wait_for_reset_link(account_email, reset_requested_at)
+            reset_url = wait_for_reset_link(
+                account_email,
+                reset_requested_at,
+                exclude_urls=exclude_urls,
+                generator_mail_session=generator_mail_session,
+            )
             if not reset_url or not is_netflix_reset_url(reset_url):
                 raise RuntimeError("invalid reset URL")
-
             page.goto(reset_url, wait_until="domcontentloaded", timeout=30000)
             fill_new_password_form(page, new_password, sign_out_all)
         finally:
-            context.close()
-            browser.close()
+            if context is not None:
+                try:
+                    context.close()
+                except Exception:
+                    pass
+            if browser is not None:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+            if generator_mail_session is not None:
+                try:
+                    generator_mail_session.close()
+                except Exception:
+                    pass
+
 
 
 def password_rotation_worker(chat_id, user_id, account_email, status_message_id):
@@ -1068,12 +1402,15 @@ def password_rotation_worker(chat_id, user_id, account_email, status_message_id)
 # Keyboards
 # ============================================================
 
+
 def main_keyboard(user_id):
     user = get_user_data(user_id)
     if not user:
         return None
-
-    _, balance_text = get_current_balance(user["api_key"])
+    balance_text = user_last_balance_texts.get(user_id)
+    if balance_text is None:
+        _, balance_text = get_current_balance(user.get("api_key", ""))
+        user_last_balance_texts[user_id] = balance_text
     with state_lock:
         sign_out = bool(BOT_STATE.get("netflix_sign_out_all", True))
 
@@ -1093,10 +1430,7 @@ def main_keyboard(user_id):
         InlineKeyboardButton("🔐 تغيير رمز النتفلكس", callback_data="netflix_rotate_password"),
     )
     markup.add(
-        InlineKeyboardButton(
-            "📱 شراء رقم عراقي (آسياسيل أو زين العراق)",
-            callback_data="buy_number",
-        )
+        InlineKeyboardButton("📱 شراء رقم عراقي (آسياسيل أو زين العراق)", callback_data="buy_number")
     )
     markup.add(InlineKeyboardButton("💳 إيداع الأموال (USDT - BSC)", callback_data="deposit_bsc"))
     markup.add(
@@ -1106,12 +1440,10 @@ def main_keyboard(user_id):
         )
     )
     markup.add(
-        InlineKeyboardButton(
-            "✏️ تغيير كلمة المرور الافتراضية",
-            callback_data="netflix_change_default_password",
-        )
+        InlineKeyboardButton("✏️ تغيير كلمة المرور الافتراضية", callback_data="netflix_change_default_password")
     )
     return markup
+
 
 # ============================================================
 # Telegram handlers
@@ -1135,490 +1467,140 @@ def send_welcome(message):
     )
 
 
+
 @bot.message_handler(func=lambda message: True)
 def handle_text_messages(message):
-    user_id = message.from_user.id
-    user = get_user_data(user_id)
-    if not user or not message.text:
-        return
-
-    state = user_states.get(user_id)
-    text = message.text.strip()
-
-    # New email/profile manager states are dictionaries so they cannot collide
-    # with any of the original string states below.
-    if isinstance(state, dict):
-        kind = state.get("kind")
-        if kind == "temp_manual_email":
-            local = text.lower().strip()
-            address = local if "@" in local else f"{local}@{TEMPMAIL_DOMAIN}"
-            if not re.fullmatch(r"[a-z0-9._-]{3,32}@" + re.escape(TEMPMAIL_DOMAIN), address):
-                bot.send_message(message.chat.id, "❌ اسم الإيميل غير صالح.")
-                return
-            item, created = add_managed_email(user_id, address, "manual")
-            user_states.pop(user_id, None)
-            bot.send_message(
-                message.chat.id,
-                ("✅ تم إنشاء الإيميل" if created else "ℹ️ الإيميل موجود مسبقاً")
-                + "\n\n"
-                + managed_email_summary(item),
-                reply_markup=managed_email_keyboard(item),
-            )
+    try:
+        user_id = message.from_user.id
+        user = get_user_data(user_id)
+        if not user or not message.text:
             return
+        state = user_states.get(user_id)
+        text = message.text.strip()
 
-        if kind == "temp_change_pin":
-            if not re.fullmatch(r"\d{3,12}", text):
-                bot.send_message(message.chat.id, "أرسل رمزاً من 3 إلى 12 رقم.")
-                return
-            item = get_managed_email(user_id, state.get("email_id"))
-            profile = (
-                next(
-                    (p for p in item.get("profiles", []) if p.get("number") == state.get("profile_number")),
-                    None,
-                )
-                if item
-                else None
-            )
-            if not profile:
+        if isinstance(state, dict):
+            kind = state.get("kind")
+            if kind == "temp_manual_email":
+                local = text.lower().strip()
+                address = local if "@" in local else f"{local}@{TEMPMAIL_DOMAIN}"
+                if not re.fullmatch(r"[a-z0-9._-]{3,32}@" + re.escape(TEMPMAIL_DOMAIN), address):
+                    bot.send_message(message.chat.id, "❌ اسم الإيميل غير صالح. استخدم أحرفاً إنجليزية وأرقاماً فقط.")
+                    return
+                item, created = add_managed_email(user_id, address, "manual")
                 user_states.pop(user_id, None)
-                bot.send_message(message.chat.id, "❌ لم يتم العثور على البروفايل.")
-                return
-            profile["pin"] = text
-            save_state(BOT_STATE)
-            user_states.pop(user_id, None)
-            bot.send_message(
-                message.chat.id,
-                "✅ تم تغيير الرمز.",
-                reply_markup=profile_keyboard(item, profile),
-            )
-            return
-
-    if state == "waiting_for_amount":
-        try:
-            amount = float(text)
-            if amount < 1.5:
                 bot.send_message(
                     message.chat.id,
-                    "⚠️ عذراً، الحد الأدنى للإيداع هو **1.5 دولار**.",
-                    parse_mode="Markdown",
+                    ("✅ تم إنشاء الإيميل" if created else "ℹ️ الإيميل موجود مسبقاً") + "\n\n" + managed_email_summary(item),
+                    reply_markup=managed_email_keyboard(item),
                 )
                 return
-            user_states.pop(user_id, None)
+
+            if kind == "temp_change_pin":
+                if not re.fullmatch(r"\d{3,12}", text):
+                    bot.send_message(message.chat.id, "أرسل رمزاً من 3 إلى 12 رقم.")
+                    return
+                item = get_managed_email(user_id, state.get("email_id"))
+                profile = None
+                if item:
+                    profile = next(
+                        (p for p in item.get("profiles", []) if p.get("number") == state.get("profile_number")),
+                        None,
+                    )
+                if not profile:
+                    user_states.pop(user_id, None)
+                    bot.send_message(message.chat.id, "❌ لم يتم العثور على البروفايل.", reply_markup=main_keyboard(user_id))
+                    return
+                with state_lock:
+                    profile["pin"] = text
+                save_state(BOT_STATE)
+                user_states.pop(user_id, None)
+                bot.send_message(message.chat.id, "✅ تم تغيير الرمز.", reply_markup=profile_keyboard(item, profile))
+                return
+
+        if state == "waiting_for_amount":
+            try:
+                amount = float(text)
+            except ValueError:
+                bot.send_message(message.chat.id, "⚠️ يرجى إدخال رقم صحيح.")
+                return
+            if amount < 1.5:
+                bot.send_message(message.chat.id, "⚠️ عذراً، الحد الأدنى للإيداع هو **1.5 دولار**.", parse_mode="Markdown")
+                return
             bot.send_message(
                 message.chat.id,
                 f"⏳ جاري إنشاء محفظة إيداع بمبلغ **{amount}$** عبر شبكة USDT BSC...",
                 parse_mode="Markdown",
             )
-            params = {"api_key": user["api_key"], "coin": "usdt", "network": "bsc"}
-            response = requests.get(WALLET_URL, params=params, timeout=15)
-            wallet_address = response.json().get("wallet_address", "تعذر الحصول على العنوان")
-            markup = InlineKeyboardMarkup()
-            markup.add(InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="main_menu"))
+            try:
+                params = {"api_key": user["api_key"], "coin": "usdt", "network": "bsc"}
+                response = requests.get(WALLET_URL, params=params, timeout=15)
+                response.raise_for_status()
+                payload = response.json()
+                wallet_address = str(payload.get("wallet_address") or "").strip()
+                if not wallet_address:
+                    raise RuntimeError("wallet missing")
+            except Exception:
+                bot.send_message(message.chat.id, "❌ تعذر إنشاء عنوان الإيداع حالياً. حاول مرة أخرى.")
+                return
+            user_states.pop(user_id, None)
             bot.send_message(
                 message.chat.id,
                 f"💳 **عنوان المحفظة للإيداع بقيمة {amount}$ (USDT - BSC):**\n\n`{wallet_address}`",
-                reply_markup=markup,
+                reply_markup=back_to_main_keyboard(),
                 parse_mode="Markdown",
             )
-        except ValueError:
-            bot.send_message(message.chat.id, "⚠️ يرجى إدخال رقم صحيح.")
-        return
-
-    if state == "waiting_for_netflix_email":
-        account_email = normalize_email(text)
-        if not is_valid_email(account_email):
-            bot.send_message(message.chat.id, "أرسل بريداً إلكترونياً صحيحاً.")
             return
-        if not is_authorized_netflix_email(account_email):
-            bot.send_message(message.chat.id, "هذا البريد غير موجود ضمن الحسابات المسموح بإدارتها ❌")
+
+        if state == "waiting_for_netflix_email":
+            account_email = normalize_email(text)
+            if not is_valid_email(account_email):
+                bot.send_message(message.chat.id, "أرسل بريداً إلكترونياً صحيحاً.")
+                return
+            if not is_authorized_netflix_email(account_email):
+                bot.send_message(message.chat.id, "هذا البريد غير موجود ضمن الحسابات المسموح بإدارتها ❌")
+                user_states.pop(user_id, None)
+                return
+            if user_id in active_password_rotations:
+                bot.send_message(message.chat.id, "توجد عملية جارية حالياً، انتظر حتى تنتهي.")
+                return
             user_states.pop(user_id, None)
-            return
-        if user_id in active_password_rotations:
-            bot.send_message(message.chat.id, "توجد عملية جارية حالياً، انتظر حتى تنتهي.")
+            active_password_rotations.add(user_id)
+            working = bot.send_message(message.chat.id, "⏳ جارٍ العمل...")
+            threading.Thread(
+                target=password_rotation_worker,
+                args=(message.chat.id, user_id, account_email, working.message_id),
+                daemon=True,
+            ).start()
             return
 
-        user_states.pop(user_id, None)
-        active_password_rotations.add(user_id)
-        working = bot.send_message(message.chat.id, "⏳ جارٍ العمل...")
-        threading.Thread(
-            target=password_rotation_worker,
-            args=(message.chat.id, user_id, account_email, working.message_id),
-            daemon=True,
-        ).start()
-        return
-
-    if state == "waiting_for_new_default_password":
-        if not strong_enough(text):
-            bot.send_message(message.chat.id, "يجب أن تكون كلمة المرور بين 6 و60 حرفاً.")
-            return
-        with state_lock:
-            BOT_STATE["netflix_default_password"] = text
+        if state == "waiting_for_new_default_password":
+            if not strong_enough(text):
+                bot.send_message(message.chat.id, "يجب أن تكون كلمة المرور بين 6 و60 حرفاً.")
+                return
+            with state_lock:
+                BOT_STATE["netflix_default_password"] = text
             save_state(BOT_STATE)
-        user_states.pop(user_id, None)
-        bot.send_message(
-            message.chat.id,
-            "تم تحديث كلمة المرور الافتراضية ✅",
-            reply_markup=main_keyboard(user_id),
-        )
-        return
-
-
-@bot.callback_query_handler(func=lambda call: True)
-def callback_listener(call):
-    chat_id = call.message.chat.id
-    user_id = call.from_user.id
-    user = get_user_data(user_id)
-    if not user:
-        bot.answer_callback_query(call.id, "هذا البوت ليس مخصصاً لك!", show_alert=True)
-        return
-
-    api_key = user["api_key"]
-
-    # --------------------------------------------------------
-    # Temporary email + profiles callbacks (additive; original callbacks below stay intact)
-    # --------------------------------------------------------
-    if call.data == "email_create_menu":
-        bot.answer_callback_query(call.id)
-        bot.edit_message_text(
-            "اختر طريقة إنشاء الإيميل:",
-            chat_id,
-            call.message.message_id,
-            reply_markup=email_create_keyboard(),
-        )
-        return
-
-    if call.data == "email_create_random":
-        item, _ = add_managed_email(
-            user_id,
-            f"{make_temp_mail_name()}@{TEMPMAIL_DOMAIN}",
-            "random",
-        )
-        bot.answer_callback_query(call.id, "تم إنشاء الإيميل")
-        bot.edit_message_text(
-            "✅ تم إنشاء إيميل جديد\n\n" + managed_email_summary(item),
-            chat_id,
-            call.message.message_id,
-            reply_markup=managed_email_keyboard(item),
-        )
-        return
-
-    if call.data == "email_create_manual":
-        user_states[user_id] = {"kind": "temp_manual_email"}
-        bot.answer_callback_query(call.id)
-        bot.send_message(
-            chat_id,
-            f"✍️ أرسل اسم الإيميل فقط مثل nabil77 وسأضيف @{TEMPMAIL_DOMAIN}\n"
-            f"أو أرسل إيميلاً كاملاً على @{TEMPMAIL_DOMAIN}.",
-        )
-        return
-
-    if call.data in ("emails_list", "emails_sold"):
-        sold_only = call.data == "emails_sold"
-        emails = [
-            item
-            for item in temp_user_state(user_id).get("emails", [])
-            if (item.get("status") == "completed") == sold_only
-        ]
-        bot.answer_callback_query(call.id)
-        if not emails:
-            bot.send_message(chat_id, "لا توجد إيميلات هنا حالياً.")
+            user_states.pop(user_id, None)
+            bot.send_message(message.chat.id, "تم تحديث كلمة المرور الافتراضية ✅", reply_markup=main_keyboard(user_id))
             return
-        markup = InlineKeyboardMarkup(row_width=1)
-        for item in emails:
-            markup.add(
-                InlineKeyboardButton(
-                    item["address"],
-                    callback_data=f"email_open:{item['id']}",
-                )
-            )
-        markup.add(InlineKeyboardButton("🔙 الرئيسية", callback_data="main_menu"))
-        bot.send_message(
-            chat_id,
-            "اختر الإيميل:" if not sold_only else "الإيميلات المباعة:",
-            reply_markup=markup,
-        )
-        return
 
-    if call.data.startswith("email_open:"):
-        email_id = call.data.split(":", 1)[1]
-        item = get_managed_email(user_id, email_id)
-        bot.answer_callback_query(call.id)
-        if not item:
-            bot.send_message(chat_id, "❌ لم يتم العثور على الإيميل.")
-            return
-        temp_user_state(user_id)["selected"] = item["id"]
-        save_state(BOT_STATE)
-        bot.send_message(
-            chat_id,
-            managed_email_summary(item),
-            reply_markup=managed_email_keyboard(item),
-        )
-        return
-
-    if call.data.startswith("email_profiles:"):
-        email_id = call.data.split(":", 1)[1]
-        item = get_managed_email(user_id, email_id)
-        bot.answer_callback_query(call.id)
-        if item:
-            bot.send_message(chat_id, "👥 البروفايلات 1 → 5", reply_markup=profiles_keyboard(item))
-        return
-
-    if call.data.startswith("email_profile:"):
-        _, email_id, number_text = call.data.split(":", 2)
-        item = get_managed_email(user_id, email_id)
-        profile = (
-            next((p for p in item.get("profiles", []) if p.get("number") == int(number_text)), None)
-            if item
-            else None
-        )
-        bot.answer_callback_query(call.id)
-        if profile:
-            status_ar = {
-                "available": "متاح",
-                "review": "قيد المراجعة",
-                "sold": "تم البيع",
-            }.get(profile.get("status"), profile.get("status"))
-            bot.send_message(
-                chat_id,
-                f"{PROFILE_COLORS[profile['number']]} البروفايل {profile['number']}\n"
-                f"🔐 الرمز: {profile['pin']}\n"
-                f"📌 الحالة: {status_ar}\n"
-                f"📧 {item['address']}",
-                reply_markup=profile_keyboard(item, profile),
-            )
-        return
-
-    if call.data.startswith("email_change_pin:"):
-        _, email_id, number_text = call.data.split(":", 2)
-        user_states[user_id] = {
-            "kind": "temp_change_pin",
-            "email_id": email_id,
-            "profile_number": int(number_text),
-        }
-        bot.answer_callback_query(call.id)
-        bot.send_message(chat_id, "✏️ أرسل الرمز الجديد:")
-        return
-
-    if call.data.startswith("email_profile_status:"):
-        _, email_id, number_text, status = call.data.split(":", 3)
-        if status not in {"available", "review", "sold"}:
-            return
-        item = get_managed_email(user_id, email_id)
-        profile = (
-            next((p for p in item.get("profiles", []) if p.get("number") == int(number_text)), None)
-            if item
-            else None
-        )
-        bot.answer_callback_query(call.id)
-        if not profile:
-            return
-        profile["status"] = status
-        profile["sold_at"] = time.time() if status == "sold" else None
-        if all(p.get("status") == "sold" for p in item.get("profiles", [])):
-            item["status"] = "completed"
-        elif item.get("status") == "completed":
-            item["status"] = "active"
-        save_state(BOT_STATE)
-        bot.send_message(
-            chat_id,
-            "✅ تم تحديث حالة البروفايل.",
-            reply_markup=profile_keyboard(item, profile),
-        )
-        return
-
-    if call.data.startswith("email_delete:"):
-        email_id = call.data.split(":", 1)[1]
-        data = temp_user_state(user_id)
-        data["emails"] = [x for x in data.get("emails", []) if x.get("id") != email_id]
-        if data.get("selected") == email_id:
-            data["selected"] = data["emails"][0]["id"] if data["emails"] else None
-        save_state(BOT_STATE)
-        bot.answer_callback_query(call.id, "تم الحذف")
-        bot.send_message(chat_id, "🗑️ تم حذف الإيميل من البوت.")
-        return
-
-    if call.data.startswith("show_email:"):
-        item = get_managed_email(user_id, call.data.split(":", 1)[1])
-        bot.answer_callback_query(call.id)
-        if item:
-            bot.send_message(chat_id, f"📧 `{item['address']}`", parse_mode="Markdown")
-        return
-
-    if call.data.startswith("email_code_or_link:"):
-        item = get_managed_email(user_id, call.data.split(":", 1)[1])
-        bot.answer_callback_query(call.id)
-        if not item:
-            return
+        # A normal text outside a flow should never become a silent dead-end.
+        bot.send_message(message.chat.id, "اختر أحد الأزرار من القائمة 👇", reply_markup=main_keyboard(user_id))
+    except Exception as exc:
+        print(f"text handler failed: {type(exc).__name__}")
         try:
-            messages = fetch_temp_mailbox(item["address"])
+            bot.send_message(message.chat.id, "❌ حدث خطأ مؤقت. افتح /menu وحاول مرة أخرى.")
         except Exception:
-            bot.send_message(chat_id, "❌ تعذر جلب البريد حالياً.")
-            return
-        found = None
-        # Requested priority: code first; if no code, important link.
-        for message in messages:
-            if message.get("code"):
-                found = ("code", message["code"], message)
-                break
-        if not found:
-            for message in messages:
-                link = important_message_url(message.get("urls", []))
-                if link:
-                    found = ("url", link, message)
-                    break
-        if not found:
-            bot.send_message(chat_id, "📭 لا يوجد كود أو رابط مهم حالياً.")
-            return
-        kind, value, message = found
-        discovered = message_discovered_at(item, message)
-        save_state(BOT_STATE)
-        markup = InlineKeyboardMarkup()
-        if kind == "code":
-            try:
-                markup.add(InlineKeyboardButton(f"📋 نسخ الكود {value}", copy_text={"text": value}))
-            except TypeError:
-                pass
-            bot.send_message(
-                chat_id,
-                f"🔢 آخر كود: {value}\n⏱️ وصل هذا الكود {relative_time(discovered)}",
-                reply_markup=markup,
-            )
-        else:
-            markup.add(InlineKeyboardButton("🔗 فتح الرابط", url=value))
-            bot.send_message(chat_id, "🔗 تم العثور على الرابط المهم.", reply_markup=markup)
-        return
+            pass
 
-    if call.data.startswith("email_latest:") or call.data.startswith("email_all_messages:"):
-        all_messages = call.data.startswith("email_all_messages:")
-        email_id = call.data.split(":", 1)[1]
-        item = get_managed_email(user_id, email_id)
-        bot.answer_callback_query(call.id)
-        if not item:
-            return
-        try:
-            messages = fetch_temp_mailbox(item["address"])
-        except Exception:
-            bot.send_message(chat_id, "❌ تعذر جلب الرسائل حالياً.")
-            return
-        messages = messages if all_messages else messages[:5]
-        if not messages:
-            bot.send_message(chat_id, "📭 لا توجد رسائل حالياً.")
-            return
-        for index, message in enumerate(messages, 1):
-            discovered = message_discovered_at(item, message)
-            body = message.get("body") or "(الرسالة بدون نص ظاهر)"
-            text = (
-                f"📬 الرسالة {index}\n"
-                f"📧 إلى: {item['address']}\n"
-                f"👤 من: {message.get('from', 'غير معروف')}\n"
-                f"📝 العنوان: {message.get('subject', 'بدون عنوان')}\n"
-                f"⏱️ وصلت {relative_time(discovered)}\n"
-                "━━━━━━━━━━━━━━\n"
-                f"{body[:3200]}"
-            )
-            keyboard = InlineKeyboardMarkup()
-            if message.get("code"):
-                try:
-                    keyboard.add(
-                        InlineKeyboardButton(
-                            f"📋 نسخ الكود {message['code']}",
-                            copy_text={"text": str(message["code"])},
-                        )
-                    )
-                except TypeError:
-                    pass
-            link = important_message_url(message.get("urls", []))
-            if link:
-                keyboard.add(InlineKeyboardButton("🔗 فتح الرابط المهم", url=link))
-            bot.send_message(chat_id, text, reply_markup=keyboard)
-        if not all_messages:
-            more = InlineKeyboardMarkup()
-            more.add(
-                InlineKeyboardButton(
-                    "📚 جلب كل الرسائل والكودات",
-                    callback_data=f"email_all_messages:{item['id']}",
-                )
-            )
-            bot.send_message(chat_id, "لإظهار كل محتوى الصندوق:", reply_markup=more)
-        save_state(BOT_STATE)
-        return
 
-    if call.data == "netflix_rotate_password":
-        user_states[user_id] = "waiting_for_netflix_email"
-        bot.answer_callback_query(call.id)
-        markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("🔙 إلغاء", callback_data="main_menu"))
-        bot.edit_message_text(
-            "🔐 أرسل الآن إيميل حساب نتفلكس المسموح بإدارته:",
-            chat_id,
-            call.message.message_id,
-            reply_markup=markup,
-        )
-        return
 
-    if call.data == "netflix_toggle_signout":
-        with state_lock:
-            BOT_STATE["netflix_sign_out_all"] = not bool(BOT_STATE.get("netflix_sign_out_all", True))
-            save_state(BOT_STATE)
-        bot.answer_callback_query(call.id, "تم تحديث الخيار")
-        bot.edit_message_reply_markup(
-            chat_id,
-            call.message.message_id,
-            reply_markup=main_keyboard(user_id),
-        )
-        return
 
-    if call.data == "netflix_change_default_password":
-        user_states[user_id] = "waiting_for_new_default_password"
-        bot.answer_callback_query(call.id)
-        markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("🔙 إلغاء", callback_data="main_menu"))
-        bot.edit_message_text(
-            "✏️ أرسل كلمة المرور الافتراضية الجديدة الآن:\n\n"
-            "لن يتم عرضها مجدداً داخل البوت.",
-            chat_id,
-            call.message.message_id,
-            reply_markup=markup,
-        )
-        return
-
-    if call.data == "deposit_bsc":
-        user_states[user_id] = "waiting_for_amount"
-        markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("🔙 إلغاء والعودة للقائمة", callback_data="main_menu"))
-        bot.edit_message_text(
-            "💳 **إيداع الأموال (USDT - BSC):**\nأرسل الآن المبلغ:",
-            chat_id,
-            call.message.message_id,
-            reply_markup=markup,
-            parse_mode="Markdown",
-        )
-        return
-
-    if call.data == "main_menu":
-        user_states.pop(user_id, None)
-        bot.edit_message_text(
-            f"مرحباً بك يا **{user['name']}** في بوت أرقام نتفلكس العراقية 🇮🇶",
-            chat_id,
-            call.message.message_id,
-            reply_markup=main_keyboard(user_id),
-            parse_mode="Markdown",
-        )
-        return
-
-    if call.data == "buy_number":
-        user_states.pop(user_id, None)
-        bot.answer_callback_query(call.id, "جاري البحث المستمر عن رقم...")
-        if chat_id in user_active_orders:
-            cancel_order(api_key, user_active_orders[chat_id])
-            user_active_orders.pop(chat_id, None)
-
-        status_msg = bot.send_message(chat_id, "⏳ جاري البحث المستمر عن رقم يبدأ بـ 96477 أو 96478...")
-        success = False
-        phone_number = ""
-        activation_id = ""
-
-        while not success:
+def buy_number_worker(chat_id, user_id, api_key, status_message_id, cancel_event):
+    activation_id = None
+    phone_number = None
+    try:
+        while not cancel_event.is_set():
             params = {
                 "api_key": api_key,
                 "action": "getNumber",
@@ -1627,19 +1609,29 @@ def callback_listener(call):
             }
             try:
                 response = requests.get(BASE_URL, params=params, timeout=15)
+                response.raise_for_status()
                 res_text = response.text.strip()
                 if res_text.startswith("ACCESS_NUMBER:"):
                     parts = res_text.split(":")
-                    activation_id = parts[1]
-                    phone_number = parts[2]
-                    if phone_number.startswith("96477") or phone_number.startswith("96478"):
-                        success = True
-                    else:
+                    if len(parts) >= 3:
+                        activation_id, phone_number = parts[1], parts[2]
+                        if phone_number.startswith(("96477", "96478")):
+                            break
                         cancel_order(api_key, activation_id)
-                else:
-                    time.sleep(3)
+                        activation_id = None
+                        phone_number = None
+                time.sleep(2.5)
             except Exception:
                 time.sleep(3)
+
+        if cancel_event.is_set():
+            if activation_id:
+                cancel_order(api_key, activation_id)
+            safe_edit_message(chat_id, status_message_id, "❌ تم إلغاء البحث عن الرقم.", reply_markup=main_keyboard(user_id))
+            return
+        if not activation_id or not phone_number:
+            safe_edit_message(chat_id, status_message_id, "❌ تعذر الحصول على رقم حالياً.", reply_markup=main_keyboard(user_id))
+            return
 
         user_active_orders[chat_id] = activation_id
         cancel_markup = InlineKeyboardMarkup()
@@ -1656,39 +1648,399 @@ def callback_listener(call):
             f"🆔 رقم العملية:\n`{activation_id}`\n\n"
             "⏳ جاري انتظار وصول الكود..."
         )
-        try:
-            bot.delete_message(chat_id, status_msg.message_id)
-        except Exception:
-            pass
-        bot.send_message(chat_id, msg, reply_markup=cancel_markup, parse_mode="Markdown")
+        safe_edit_message(
+            chat_id,
+            status_message_id,
+            msg,
+            reply_markup=cancel_markup,
+            parse_mode="Markdown",
+        )
         threading.Thread(
             target=check_for_sms,
             args=(chat_id, api_key, activation_id, phone_number),
             daemon=True,
         ).start()
-        return
+    finally:
+        with number_search_lock:
+            current = number_search_jobs.get(chat_id)
+            if current is cancel_event:
+                number_search_jobs.pop(chat_id, None)
 
-    if call.data.startswith("cancel_num_"):
-        activation_id = call.data.split("cancel_num_", 1)[1]
-        bot.answer_callback_query(call.id, "جاري إلغاء الرقم...")
-        cancel_order(api_key, activation_id)
-        if user_active_orders.get(chat_id) == activation_id:
-            user_active_orders.pop(chat_id, None)
-        bot.send_message(chat_id, "❌ **تم إلغاء الرقم بنجاح واسترداد الرصيد.**", parse_mode="Markdown")
-        return
 
-    if call.data == "get_balance":
-        _, balance_text = get_current_balance(api_key)
-        bot.answer_callback_query(call.id, f"رصيدك الحالي هو: {balance_text}", show_alert=True)
-        return
+
+@bot.callback_query_handler(func=lambda call: True)
+def callback_listener(call):
+    try:
+        if not getattr(call, "message", None):
+            safe_answer_callback(call, "تعذر تنفيذ هذا الزر.", True)
+            return
+        chat_id = call.message.chat.id
+        user_id = call.from_user.id
+        user = get_user_data(user_id)
+        if not user:
+            safe_answer_callback(call, "هذا البوت ليس مخصصاً لك!", True)
+            return
+        api_key = user.get("api_key", "")
+        data = str(call.data or "")
+
+        if data == "email_create_menu":
+            safe_answer_callback(call)
+            safe_edit_message(chat_id, call.message.message_id, "اختر طريقة إنشاء الإيميل:", reply_markup=email_create_keyboard())
+            return
+
+        if data == "email_create_random":
+            item, _ = add_managed_email(user_id, f"{make_temp_mail_name()}@{TEMPMAIL_DOMAIN}", "random")
+            safe_answer_callback(call, "تم إنشاء الإيميل")
+            safe_edit_message(
+                chat_id,
+                call.message.message_id,
+                "✅ تم إنشاء إيميل جديد\n\n" + managed_email_summary(item),
+                reply_markup=managed_email_keyboard(item),
+            )
+            return
+
+        if data == "email_create_manual":
+            user_states[user_id] = {"kind": "temp_manual_email"}
+            safe_answer_callback(call)
+            safe_edit_message(
+                chat_id,
+                call.message.message_id,
+                f"✍️ أرسل اسم الإيميل فقط مثل nabil77 وسأضيف @{TEMPMAIL_DOMAIN}\n"
+                f"أو أرسل إيميلاً كاملاً على @{TEMPMAIL_DOMAIN}.",
+                reply_markup=back_to_main_keyboard(),
+            )
+            return
+
+        if data in {"emails_list", "emails_sold"}:
+            sold_only = data == "emails_sold"
+            emails = [
+                item for item in temp_user_state(user_id).get("emails", [])
+                if (item.get("status") == "completed") == sold_only
+            ]
+            safe_answer_callback(call)
+            markup = InlineKeyboardMarkup(row_width=1)
+            for item in emails:
+                markup.add(InlineKeyboardButton(item["address"], callback_data=f"email_open:{item['id']}"))
+            markup.add(InlineKeyboardButton("🔙 الرئيسية", callback_data="main_menu"))
+            title = "الإيميلات المباعة:" if sold_only else "اختر الإيميل:"
+            if not emails:
+                title = "📭 لا توجد إيميلات هنا حالياً."
+            bot.send_message(chat_id, title, reply_markup=markup)
+            return
+
+        if data.startswith("email_open:"):
+            item = get_managed_email(user_id, data.split(":", 1)[1])
+            safe_answer_callback(call)
+            if not item:
+                bot.send_message(chat_id, "❌ لم يتم العثور على الإيميل.", reply_markup=back_to_main_keyboard())
+                return
+            with state_lock:
+                temp_user_state(user_id)["selected"] = item["id"]
+            save_state(BOT_STATE)
+            bot.send_message(chat_id, managed_email_summary(item), reply_markup=managed_email_keyboard(item))
+            return
+
+        if data.startswith("email_profiles:"):
+            item = get_managed_email(user_id, data.split(":", 1)[1])
+            safe_answer_callback(call)
+            if not item:
+                bot.send_message(chat_id, "❌ لم يتم العثور على الإيميل.", reply_markup=back_to_main_keyboard())
+                return
+            bot.send_message(chat_id, "👥 البروفايلات 1 → 5", reply_markup=profiles_keyboard(item))
+            return
+
+        if data.startswith("email_profile:"):
+            parts = _parse_email_profile_callback(data, 3)
+            safe_answer_callback(call)
+            if not parts:
+                bot.send_message(chat_id, "❌ بيانات الزر غير صالحة.")
+                return
+            _, email_id, number_text = parts
+            try:
+                number = int(number_text)
+            except ValueError:
+                bot.send_message(chat_id, "❌ رقم البروفايل غير صالح.")
+                return
+            item = get_managed_email(user_id, email_id)
+            profile = next((p for p in item.get("profiles", []) if p.get("number") == number), None) if item else None
+            if not profile:
+                bot.send_message(chat_id, "❌ لم يتم العثور على البروفايل.")
+                return
+            status_ar = {"available": "متاح", "review": "قيد المراجعة", "sold": "تم البيع"}.get(profile.get("status"), "متاح")
+            bot.send_message(
+                chat_id,
+                f"{PROFILE_COLORS.get(number, '👤')} البروفايل {number}\n"
+                f"🔐 الرمز: {profile['pin']}\n📌 الحالة: {status_ar}\n📧 {item['address']}",
+                reply_markup=profile_keyboard(item, profile),
+            )
+            return
+
+        if data.startswith("email_change_pin:"):
+            parts = _parse_email_profile_callback(data, 3)
+            safe_answer_callback(call)
+            if not parts:
+                bot.send_message(chat_id, "❌ بيانات الزر غير صالحة.")
+                return
+            _, email_id, number_text = parts
+            try:
+                number = int(number_text)
+            except ValueError:
+                bot.send_message(chat_id, "❌ رقم البروفايل غير صالح.")
+                return
+            item = get_managed_email(user_id, email_id)
+            if not item or not any(p.get("number") == number for p in item.get("profiles", [])):
+                bot.send_message(chat_id, "❌ لم يتم العثور على البروفايل.")
+                return
+            user_states[user_id] = {"kind": "temp_change_pin", "email_id": email_id, "profile_number": number}
+            bot.send_message(chat_id, "✏️ أرسل الرمز الجديد:", reply_markup=back_to_main_keyboard())
+            return
+
+        if data.startswith("email_profile_status:"):
+            parts = _parse_email_profile_callback(data, 4)
+            safe_answer_callback(call)
+            if not parts:
+                bot.send_message(chat_id, "❌ بيانات الزر غير صالحة.")
+                return
+            _, email_id, number_text, status = parts
+            if status not in {"available", "review", "sold"}:
+                bot.send_message(chat_id, "❌ الحالة غير صالحة.")
+                return
+            try:
+                number = int(number_text)
+            except ValueError:
+                bot.send_message(chat_id, "❌ رقم البروفايل غير صالح.")
+                return
+            item = get_managed_email(user_id, email_id)
+            profile = next((p for p in item.get("profiles", []) if p.get("number") == number), None) if item else None
+            if not profile:
+                bot.send_message(chat_id, "❌ لم يتم العثور على البروفايل.")
+                return
+            with state_lock:
+                profile["status"] = status
+                profile["sold_at"] = time.time() if status == "sold" else None
+                item["status"] = "completed" if all(p.get("status") == "sold" for p in item.get("profiles", [])) else "active"
+            save_state(BOT_STATE)
+            bot.send_message(chat_id, "✅ تم تحديث حالة البروفايل.", reply_markup=profile_keyboard(item, profile))
+            return
+
+        if data.startswith("email_delete:"):
+            email_id = data.split(":", 1)[1]
+            state = temp_user_state(user_id)
+            with state_lock:
+                before = len(state.get("emails", []))
+                state["emails"] = [x for x in state.get("emails", []) if x.get("id") != email_id]
+                if state.get("selected") == email_id:
+                    state["selected"] = state["emails"][0]["id"] if state["emails"] else None
+                deleted = len(state["emails"]) < before
+            save_state(BOT_STATE)
+            safe_answer_callback(call, "تم الحذف" if deleted else "الإيميل غير موجود")
+            bot.send_message(chat_id, "🗑️ تم حذف الإيميل من البوت." if deleted else "❌ لم يتم العثور على الإيميل.", reply_markup=back_to_main_keyboard())
+            return
+
+        if data.startswith("show_email:"):
+            item = get_managed_email(user_id, data.split(":", 1)[1])
+            safe_answer_callback(call)
+            if item:
+                bot.send_message(chat_id, f"📧 `{item['address']}`", parse_mode="Markdown")
+            return
+
+        if data.startswith("email_code_or_link:"):
+            item = get_managed_email(user_id, data.split(":", 1)[1])
+            safe_answer_callback(call)
+            if not item:
+                bot.send_message(chat_id, "❌ لم يتم العثور على الإيميل.")
+                return
+            try:
+                messages = fetch_temp_mailbox(item["address"])
+            except Exception:
+                bot.send_message(chat_id, "❌ تعذر جلب البريد حالياً. حاول مرة أخرى.")
+                return
+            found = next((("code", m["code"], m) for m in messages if m.get("code")), None)
+            if not found:
+                for m in messages:
+                    link = important_message_url(m.get("urls", []))
+                    if link:
+                        found = ("url", link, m)
+                        break
+            if not found:
+                bot.send_message(chat_id, "📭 لا يوجد كود أو رابط مهم حالياً.")
+                return
+            kind, value, msg = found
+            discovered = message_discovered_at(item, msg)
+            save_state(BOT_STATE)
+            markup = InlineKeyboardMarkup()
+            if kind == "code":
+                markup.add(InlineKeyboardButton(f"📋 نسخ الكود {value}", copy_text=CopyTextButton(text=str(value)[:256])))
+                bot.send_message(chat_id, f"🔢 آخر كود: {value}\n⏱️ وصل هذا الكود {relative_time(discovered)}", reply_markup=markup)
+            else:
+                markup.add(InlineKeyboardButton("🔗 فتح الرابط", url=value))
+                bot.send_message(chat_id, f"🔗 الرابط المهم\n⏱️ وصل {relative_time(discovered)}", reply_markup=markup)
+            return
+
+        if data.startswith("email_latest:") or data.startswith("email_all_messages:"):
+            all_messages = data.startswith("email_all_messages:")
+            item = get_managed_email(user_id, data.split(":", 1)[1])
+            safe_answer_callback(call)
+            if not item:
+                bot.send_message(chat_id, "❌ لم يتم العثور على الإيميل.")
+                return
+            try:
+                messages = fetch_temp_mailbox(item["address"])
+            except Exception:
+                bot.send_message(chat_id, "❌ تعذر جلب الرسائل حالياً. حاول مرة أخرى.")
+                return
+            messages = messages if all_messages else messages[:5]
+            if not messages:
+                bot.send_message(chat_id, "📭 لا توجد رسائل حالياً.")
+                return
+            for index, msg in enumerate(messages, 1):
+                discovered = message_discovered_at(item, msg)
+                body = msg.get("body") or "(الرسالة بدون نص ظاهر)"
+                text = (
+                    f"📬 الرسالة {index}\n📧 إلى: {item['address']}\n"
+                    f"👤 من: {msg.get('from', 'غير معروف')}\n"
+                    f"📝 العنوان: {msg.get('subject', 'بدون عنوان')}\n"
+                    f"⏱️ وصلت {relative_time(discovered)}\n━━━━━━━━━━━━━━\n{body[:3200]}"
+                )
+                keyboard = InlineKeyboardMarkup()
+                if msg.get("code"):
+                    keyboard.add(InlineKeyboardButton(f"📋 نسخ الكود {msg['code']}", copy_text=CopyTextButton(text=str(msg["code"])[:256])))
+                link = important_message_url(msg.get("urls", []))
+                if link:
+                    keyboard.add(InlineKeyboardButton("🔗 فتح الرابط المهم", url=link))
+                bot.send_message(chat_id, text, reply_markup=keyboard)
+            if not all_messages:
+                more = InlineKeyboardMarkup()
+                more.add(InlineKeyboardButton("📚 جلب كل الرسائل والكودات", callback_data=f"email_all_messages:{item['id']}"))
+                bot.send_message(chat_id, "لإظهار كل محتوى الصندوق:", reply_markup=more)
+            save_state(BOT_STATE)
+            return
+
+        if data == "netflix_rotate_password":
+            user_states[user_id] = "waiting_for_netflix_email"
+            safe_answer_callback(call)
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("🔙 إلغاء", callback_data="main_menu"))
+            safe_edit_message(chat_id, call.message.message_id, "🔐 أرسل الآن إيميل حساب نتفلكس المسموح بإدارته:", reply_markup=markup)
+            return
+
+        if data == "netflix_toggle_signout":
+            with state_lock:
+                BOT_STATE["netflix_sign_out_all"] = not bool(BOT_STATE.get("netflix_sign_out_all", True))
+            save_state(BOT_STATE)
+            safe_answer_callback(call, "تم تحديث الخيار")
+            try:
+                bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=main_keyboard(user_id))
+            except Exception:
+                bot.send_message(chat_id, "تم تحديث الخيار ✅", reply_markup=main_keyboard(user_id))
+            return
+
+        if data == "netflix_change_default_password":
+            user_states[user_id] = "waiting_for_new_default_password"
+            safe_answer_callback(call)
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("🔙 إلغاء", callback_data="main_menu"))
+            safe_edit_message(
+                chat_id,
+                call.message.message_id,
+                "✏️ أرسل كلمة المرور الافتراضية الجديدة الآن:\n\nلن يتم عرضها مجدداً داخل البوت.",
+                reply_markup=markup,
+            )
+            return
+
+        if data == "deposit_bsc":
+            user_states[user_id] = "waiting_for_amount"
+            safe_answer_callback(call)
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("🔙 إلغاء والعودة للقائمة", callback_data="main_menu"))
+            safe_edit_message(
+                chat_id,
+                call.message.message_id,
+                "💳 **إيداع الأموال (USDT - BSC):**\nأرسل الآن المبلغ:",
+                reply_markup=markup,
+                parse_mode="Markdown",
+            )
+            return
+
+        if data == "main_menu":
+            user_states.pop(user_id, None)
+            safe_answer_callback(call)
+            safe_edit_message(
+                chat_id,
+                call.message.message_id,
+                f"مرحباً بك يا **{user['name']}** في بوت أرقام نتفلكس العراقية 🇮🇶",
+                reply_markup=main_keyboard(user_id),
+                parse_mode="Markdown",
+            )
+            return
+
+        if data == "buy_number":
+            safe_answer_callback(call, "بدأ البحث عن رقم")
+            if not api_key:
+                bot.send_message(chat_id, "❌ API Key الخاص بالأرقام غير مضبوط.")
+                return
+            if chat_id in user_active_orders:
+                cancel_order(api_key, user_active_orders[chat_id])
+                user_active_orders.pop(chat_id, None)
+            with number_search_lock:
+                old_job = number_search_jobs.get(chat_id)
+                if old_job:
+                    old_job.set()
+                cancel_event = threading.Event()
+                number_search_jobs[chat_id] = cancel_event
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("❌ إلغاء البحث", callback_data="cancel_number_search"))
+            status_msg = bot.send_message(chat_id, "⏳ جاري البحث المستمر عن رقم يبدأ بـ 96477 أو 96478...", reply_markup=markup)
+            threading.Thread(
+                target=buy_number_worker,
+                args=(chat_id, user_id, api_key, status_msg.message_id, cancel_event),
+                daemon=True,
+            ).start()
+            return
+
+        if data == "cancel_number_search":
+            safe_answer_callback(call, "جاري إلغاء البحث...")
+            with number_search_lock:
+                event = number_search_jobs.get(chat_id)
+                if event:
+                    event.set()
+            if not event:
+                bot.send_message(chat_id, "لا توجد عملية بحث جارية.", reply_markup=main_keyboard(user_id))
+            return
+
+        if data.startswith("cancel_num_"):
+            activation_id = data.split("cancel_num_", 1)[1]
+            safe_answer_callback(call, "جاري إلغاء الرقم...")
+            cancel_order(api_key, activation_id)
+            if user_active_orders.get(chat_id) == activation_id:
+                user_active_orders.pop(chat_id, None)
+            bot.send_message(chat_id, "❌ **تم إلغاء الرقم بنجاح واسترداد الرصيد.**", parse_mode="Markdown", reply_markup=main_keyboard(user_id))
+            return
+
+        if data == "get_balance":
+            _, balance_text = get_current_balance(api_key)
+            user_last_balance_texts[user_id] = balance_text
+            safe_answer_callback(call, f"رصيدك الحالي هو: {balance_text}", True)
+            return
+
+        safe_answer_callback(call, "هذا الزر قديم أو غير معروف. افتح /menu.", True)
+    except Exception as exc:
+        print(f"callback failed: {type(exc).__name__}")
+        safe_answer_callback(call, "حدث خطأ مؤقت. افتح /menu وحاول مرة أخرى.", True)
+
 
 # ============================================================
 # Start
 # ============================================================
 
-threading.Thread(target=balance_monitor, daemon=True).start()
-threading.Thread(target=background_temp_mail_monitor, daemon=True).start()
-threading.Thread(target=cleanup_expired_emails, daemon=True).start()
+def run_bot():
+    cleanup_expired_emails(run_once=True)
+    threading.Thread(target=balance_monitor, daemon=True, name="balance-monitor").start()
+    threading.Thread(target=background_temp_mail_monitor, daemon=True, name="mail-monitor").start()
+    threading.Thread(target=cleanup_expired_emails, daemon=True, name="email-cleanup").start()
+    print("البوت يعمل الآن...")
+    bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
 
-print("البوت يعمل الآن...")
-bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
+
+if __name__ == "__main__":
+    run_bot()
