@@ -14,7 +14,9 @@ const PORT = Number(process.env.PORT || 3000);
 const GENERATOR_BASE = 'https://generator.email';
 const GENERATOR_DOMAIN = '5xu.vn';
 const TELEGRAM_BOT_TOKEN = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
-const MAIL_READER_BUILD = '2026-08-08-inbox9-v7-code-history-profile-colors';
+const MAIL_READER_BUILD = '2026-08-08-inbox9-v10-netflix-reset-helper';
+const NETFLIX_LOGIN_HELP_URL = 'https://www.netflix.com/iq/LoginHelp';
+const DEFAULT_NETFLIX_PASSWORD = 'Aa12345678911';
 const TELEGRAM_ALLOWED_IDS = new Set(
   String(process.env.TELEGRAM_ALLOWED_IDS || '')
     .split(',')
@@ -706,6 +708,10 @@ function normalizeBotState(raw) {
     chat.emails = Array.isArray(chat.emails) ? chat.emails : [];
     chat.pending = chat.pending && typeof chat.pending === 'object' ? chat.pending : null;
     chat.selectedEmailId = chat.selectedEmailId || chat.emails[0]?.id || null;
+    chat.netflixPassword = typeof chat.netflixPassword === 'string' && chat.netflixPassword.length >= 6
+      ? chat.netflixPassword.slice(0, 60)
+      : DEFAULT_NETFLIX_PASSWORD;
+    chat.netflixLogoutAll = chat.netflixLogoutAll !== false;
     chat.emails = chat.emails.map((email) => {
       const createdAt = email.createdAt || new Date().toISOString();
       const profiles = Array.isArray(email.profiles) ? email.profiles : [];
@@ -767,7 +773,7 @@ function chatKey(chatId) {
 function getBotChat(chatId, create = true) {
   const key = chatKey(chatId);
   if (!botState.chats[key] && create) {
-    botState.chats[key] = { emails: [], selectedEmailId: null, pending: null, createdAt: new Date().toISOString() };
+    botState.chats[key] = { emails: [], selectedEmailId: null, pending: null, netflixPassword: DEFAULT_NETFLIX_PASSWORD, netflixLogoutAll: true, createdAt: new Date().toISOString() };
     saveBotState();
   }
   return botState.chats[key] || null;
@@ -944,9 +950,17 @@ function emailSummaryText(email) {
   ].filter(Boolean).join('\n');
 }
 
+function mailboxPublicUrl(address = '') {
+  const email = normalizeAddress(address);
+  if (!isAllowedEmail(email)) return GENERATOR_BASE;
+  return `${GENERATOR_BASE}/inbox9/${encodeURIComponent(email)}`;
+}
+
 function emailDetailKeyboard(email) {
   const rows = [
     [{ text: '📋 نسخ الإيميل', copy_text: { text: email.address } }],
+    [{ text: '📬 فتح صندوق الإيميل', url: mailboxPublicUrl(email.address) }],
+    [{ text: '🔐 تغيير رمز نتفلكس', callback_data: `netflixreset:${email.id}` }],
     [{ text: '📥 جلب آخر الرسائل', callback_data: `latestmail:${email.id}` }],
     [{ text: '👥 البروفايلات', callback_data: `profiles:${email.id}` }],
     [{ text: '✏️ اسم محلي', callback_data: `rename:${email.id}` }, { text: '🗑️ حذف الآن', callback_data: `delete:${email.id}` }],
@@ -967,7 +981,7 @@ function profilesKeyboard(email) {
 function profileDetailKeyboard(email, profile) {
   const rows = [
     [{ text: `📋 نسخ الرمز ${profile.pin}`, copy_text: { text: String(profile.pin) } }],
-    [{ text: '🔢 جلب الكود', callback_data: `latestcode:${email.id}:${profile.number}` }],
+    [{ text: '🔎 جلب الكود أو الرابط', callback_data: `latestcode:${email.id}:${profile.number}` }],
     [{ text: '📋 نسخ الإيميل', copy_text: { text: email.address } }],
     [{ text: '✏️ تغيير الرمز', callback_data: `pin:${email.id}:${profile.number}` }]
   ];
@@ -986,6 +1000,51 @@ function profileDetailKeyboard(email, profile) {
   }
   rows.push([{ text: '⬅️ البروفايلات', callback_data: `profiles:${email.id}` }]);
   return { inline_keyboard: rows };
+}
+
+
+function netflixResetHelperKeyboard(chat, email) {
+  const password = String(chat?.netflixPassword || DEFAULT_NETFLIX_PASSWORD);
+  const logoutAll = chat?.netflixLogoutAll !== false;
+  return {
+    inline_keyboard: [
+      [{ text: '🌐 فتح صفحة استعادة نتفلكس', url: NETFLIX_LOGIN_HELP_URL }],
+      [{ text: '📋 نسخ الإيميل', copy_text: { text: email.address } }],
+      [{ text: '📋 نسخ كلمة المرور المقترحة', copy_text: { text: password } }],
+      [{ text: '✏️ تغيير كلمة المرور المقترحة', callback_data: `netflixpw:${email.id}` }],
+      [{ text: `${logoutAll ? '✅' : '⬜'} تسجيل الخروج من جميع الأجهزة`, callback_data: `netflixlogout:${email.id}` }],
+      [{ text: '🔎 جلب الكود أو الرابط', callback_data: `latestcode:${email.id}:0` }],
+      [{ text: '⬅️ رجوع للإيميل', callback_data: `email:${email.id}` }]
+    ]
+  };
+}
+
+async function showNetflixResetHelper(bot, chatId, emailId, editMessageId = null) {
+  const email = getBotEmail(chatId, emailId);
+  if (!email) {
+    await bot.sendMessage(chatId, '❌ لم أجد هذا الإيميل في بيانات البوت.');
+    return;
+  }
+  const chat = getBotChat(chatId);
+  const logoutAll = chat.netflixLogoutAll !== false;
+  const text = [
+    '🔐 مساعد تغيير رمز نتفلكس',
+    '',
+    `📧 الإيميل: ${email.address}`,
+    `🔑 كلمة المرور المقترحة: ${chat.netflixPassword || DEFAULT_NETFLIX_PASSWORD}`,
+    `📱 تسجيل الخروج من جميع الأجهزة: ${logoutAll ? 'مفعّل ✅' : 'معطّل ⬜'}`,
+    '',
+    'افتح صفحة استعادة نتفلكس، الصق الإيميل، وبعد وصول رسالة الاستعادة استخدم زر «جلب الكود أو الرابط».',
+    'إكمال تغيير كلمة المرور نفسه يتم يدوياً داخل صفحة Netflix.'
+  ].join('\n');
+  const options = { reply_markup: netflixResetHelperKeyboard(chat, email), disable_web_page_preview: true };
+  if (editMessageId) {
+    try {
+      await bot.editMessageText(text, { chat_id: chatId, message_id: editMessageId, ...options });
+      return;
+    } catch (_) {}
+  }
+  await bot.sendMessage(chatId, text, options);
 }
 
 function messageInlineKeyboard(message) {
@@ -1137,17 +1196,39 @@ async function sendMailboxToTelegram(bot, chatId, emailId = '') {
   }
 }
 
-function latestCodeFromMessages(messages = []) {
-  for (const message of Array.isArray(messages) ? messages : []) {
+function latestCodeOrLinkFromMessages(messages = []) {
+  const list = Array.isArray(messages) ? messages : [];
+
+  // الأولوية دائماً للكود: إذا وُجد أي كود في أحدث الرسائل نعيده ولا نعرض رابطاً معه.
+  for (const message of list) {
     const codes = Array.isArray(message?.codes) ? message.codes.filter(Boolean) : [];
     if (codes.length) {
       return {
-        code: String(codes[0]),
+        type: 'code',
+        value: String(codes[0]),
         receivedAt: message.receivedAt || message.createdAt || '',
         message
       };
     }
   }
+
+  // إذا لم يوجد أي كود، ابحث عن الرابط المهم فقط.
+  for (const message of list) {
+    const preferred = uniqueUserFacingLinks(
+      message?.importantLinks || selectImportantLinks(message?.links || [], message?.linkDetails || [])
+    );
+    const fallback = uniqueUserFacingLinks(message?.links || []);
+    const link = preferred[0] || fallback.find((url) => !isLowPriorityLink(url, '')) || '';
+    if (link) {
+      return {
+        type: 'link',
+        value: link,
+        receivedAt: message.receivedAt || message.createdAt || '',
+        message
+      };
+    }
+  }
+
   return null;
 }
 
@@ -1157,24 +1238,37 @@ async function sendLatestCode(bot, chatId, emailId, profileNumber = 0) {
     await bot.sendMessage(chatId, '❌ لم أجد هذا الإيميل في بيانات البوت.');
     return;
   }
-  const wait = await bot.sendMessage(chatId, `🔎 جاري جلب آخر كود...\n📧 ${email.address}`);
+  const wait = await bot.sendMessage(chatId, `🔎 جاري جلب الكود أو الرابط...\n📧 ${email.address}`);
   try {
     const { messages } = await getMailbox(email.address);
-    const found = latestCodeFromMessages(messages);
+    const found = latestCodeOrLinkFromMessages(messages);
     try { await bot.deleteMessage(chatId, wait.message_id); } catch (_) {}
     if (!found) {
-      await bot.sendMessage(chatId, `📭 لا يوجد كود ظاهر حالياً في آخر الرسائل.\n\n📧 ${email.address}`);
+      await bot.sendMessage(chatId, `📭 لا يوجد كود أو رابط واضح حالياً في آخر الرسائل.\n\n📧 ${email.address}`);
       return;
     }
+
     const when = relativeArabicTime(found.receivedAt);
     const profileLine = Number(profileNumber) ? `${profileColorEmoji(profileNumber)} البروفايل ${profileNumber}\n` : '';
+
+    if (found.type === 'code') {
+      await safeSendMessage(bot, chatId,
+        `${profileLine}🔢 آخر كود: ${found.value}\n⏱️ وصل هذا الكود ${when}\n📧 ${email.address}`,
+        { reply_markup: { inline_keyboard: [[{ text: `📋 نسخ الكود ${found.value}`, copy_text: { text: found.value } }]] } }
+      );
+      return;
+    }
+
     await safeSendMessage(bot, chatId,
-      `${profileLine}🔢 آخر كود: ${found.code}\n⏱️ وصل هذا الكود ${when}\n📧 ${email.address}`,
-      { reply_markup: { inline_keyboard: [[{ text: `📋 نسخ الكود ${found.code}`, copy_text: { text: found.code } }]] } }
+      `${profileLine}🔗 آخر رابط مهم:\n${found.value}\n⏱️ وصل هذا الرابط ${when}\n📧 ${email.address}`,
+      {
+        disable_web_page_preview: true,
+        reply_markup: { inline_keyboard: [[{ text: '🔗 فتح الرابط', url: found.value }]] }
+      }
     );
   } catch (error) {
-    try { await bot.editMessageText(`❌ تعذر جلب الكود حالياً.\n\n${String(error?.message || error)}`, { chat_id: chatId, message_id: wait.message_id }); }
-    catch (_) { await bot.sendMessage(chatId, `❌ تعذر جلب الكود حالياً.\n${String(error?.message || error)}`); }
+    try { await bot.editMessageText(`❌ تعذر جلب الكود أو الرابط حالياً.\n\n${String(error?.message || error)}`, { chat_id: chatId, message_id: wait.message_id }); }
+    catch (_) { await bot.sendMessage(chatId, `❌ تعذر جلب الكود أو الرابط حالياً.\n${String(error?.message || error)}`); }
   }
 }
 
@@ -1491,6 +1585,26 @@ function startTelegramBot() {
       }
       if (data === 'emails:active') { await showEmailList(bot, chatId, false); return; }
       if (data.startsWith('email:')) { await showEmailDetail(bot, chatId, data.split(':')[1], messageId); return; }
+      if (data.startsWith('netflixreset:')) {
+        const emailId = data.split(':')[1];
+        setSelectedBotEmail(chatId, emailId);
+        await showNetflixResetHelper(bot, chatId, emailId, messageId);
+        return;
+      }
+      if (data.startsWith('netflixlogout:')) {
+        const emailId = data.split(':')[1];
+        chat.netflixLogoutAll = chat.netflixLogoutAll === false;
+        saveBotState();
+        await showNetflixResetHelper(bot, chatId, emailId, messageId);
+        return;
+      }
+      if (data.startsWith('netflixpw:')) {
+        const emailId = data.split(':')[1];
+        chat.pending = { action: 'netflix-password', emailId };
+        saveBotState();
+        await bot.sendMessage(chatId, '✏️ أرسل كلمة المرور المقترحة الجديدة (من 6 إلى 60 حرفاً).\nمثال: Aa12345678911');
+        return;
+      }
       if (data.startsWith('profiles:')) { await showProfiles(bot, chatId, data.split(':')[1], messageId); return; }
       if (data.startsWith('profile:')) {
         const [, emailId, number] = data.split(':');
@@ -1590,6 +1704,20 @@ function startTelegramBot() {
       const chat = getBotChat(chatId);
 
       // حالات الإدخال اليدوي.
+      if (chat.pending?.action === 'netflix-password') {
+        const pending = chat.pending;
+        if (text.length < 6 || text.length > 60) {
+          await bot.sendMessage(chatId, '❌ كلمة المرور يجب أن تكون من 6 إلى 60 حرفاً. حاول مرة ثانية.');
+          return;
+        }
+        chat.netflixPassword = text;
+        chat.pending = null;
+        saveBotState();
+        await bot.sendMessage(chatId, '✅ تم حفظ كلمة المرور المقترحة داخل البوت.');
+        await showNetflixResetHelper(bot, chatId, pending.emailId);
+        return;
+      }
+
       if (chat.pending?.action === 'manual-email') {
         let local = text.toLowerCase().trim();
         if (local.includes('@')) {
