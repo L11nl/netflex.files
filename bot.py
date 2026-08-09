@@ -888,36 +888,34 @@ def extract_urls(text):
 
 
 def is_netflix_reset_url(url):
+    """Accept only the actual Netflix password-reset link, not signup/login/help links."""
     try:
-        parsed = urlparse(url)
+        parsed = urlparse(html.unescape(str(url or "").strip()))
+        if parsed.scheme.lower() != "https":
+            return False
         host = (parsed.hostname or "").lower()
         if not (host == "netflix.com" or host.endswith(".netflix.com")):
             return False
-        haystack = (parsed.path + "?" + parsed.query).lower()
-        keywords = ("password", "reset", "epr", "loginhelp", "recovery", "change")
-        return any(k in haystack for k in keywords)
+
+        # The reset mail currently points to /password?... .  Be strict here so an
+        # older signup/verification mail can never be mistaken for a reset mail.
+        path = (parsed.path or "").rstrip("/").lower()
+        if not (path == "/password" or path.endswith("/password")):
+            return False
+
+        query = parsed.query.lower()
+        # A genuine reset URL carries a short request id and/or the reset token.
+        return ("nftoken=" in query) or ("g=" in query)
     except Exception:
         return False
 
 
 def choose_reset_url(urls):
-    # Only return a Netflix HTTPS URL. Never follow arbitrary links from mail.
-    candidates = []
+    # Never fall back to an arbitrary Netflix URL.  Only /password reset links pass.
     for url in urls:
-        try:
-            parsed = urlparse(url)
-            if parsed.scheme != "https":
-                continue
-            host = (parsed.hostname or "").lower()
-            if host == "netflix.com" or host.endswith(".netflix.com"):
-                candidates.append(url)
-        except Exception:
-            continue
-
-    for url in candidates:
         if is_netflix_reset_url(url):
-            return url
-    return candidates[0] if candidates else None
+            return html.unescape(str(url).strip())
+    return None
 
 # ============================================================
 # SMSBower functions from your existing bot
@@ -1162,34 +1160,64 @@ def generator_read_messages(session, target_email):
 
 
 
-def wait_reset_link_generator(target_email, since_ts, exclude_urls=None, session=None):
+def wait_reset_link_generator(
+    target_email,
+    since_ts,
+    exclude_urls=None,
+    exclude_message_ids=None,
+    session=None,
+):
+    """Wait only for a NEW Netflix reset mail created after we submitted LoginHelp."""
     session = session or generator_session()
     exclude_urls = set(exclude_urls or ())
+    exclude_message_ids = {str(x) for x in (exclude_message_ids or ()) if x}
     deadline = time.time() + RESET_MAIL_TIMEOUT
+    saw_new_netflix_message = False
+
     while time.time() < deadline:
         try:
             messages = generator_read_messages(session, target_email)
-            for item in messages[:15]:
-                hay = f"{item['sender']}\n{item['subject']}\n{item['text']}".lower()
+            for item in messages[:20]:
+                message_id = str(item.get("id") or "")
+                if message_id and message_id in exclude_message_ids:
+                    continue
+
+                hay = f"{item.get('sender', '')}\n{item.get('subject', '')}\n{item.get('text', '')}".lower()
                 if "netflix" not in hay:
                     continue
-                chosen = choose_reset_url([u for u in item["urls"] if u not in exclude_urls])
+
+                saw_new_netflix_message = True
+                chosen = choose_reset_url(
+                    [u for u in item.get("urls", []) if u not in exclude_urls]
+                )
                 if chosen:
                     return chosen
         except Exception as exc:
             print(f"generator poll failed: {type(exc).__name__}")
         time.sleep(max(1.0, RESET_MAIL_POLL))
+
+    # If a fresh Netflix mail did arrive but it had no /password reset URL, this is
+    # different from "no mail arrived" and lets the debug screenshots show the mail.
+    if saw_new_netflix_message:
+        raise RuntimeError("invalid reset URL")
     raise TimeoutError("reset email timeout")
 
 
 
 
-def wait_for_reset_link(target_email, since_ts, exclude_urls=None, generator_mail_session=None):
+def wait_for_reset_link(
+    target_email,
+    since_ts,
+    exclude_urls=None,
+    exclude_message_ids=None,
+    generator_mail_session=None,
+):
     if MAIL_MODE == "generator":
         return wait_reset_link_generator(
             target_email,
             since_ts,
             exclude_urls=exclude_urls,
+            exclude_message_ids=exclude_message_ids,
             session=generator_mail_session,
         )
     return wait_reset_link_imap(target_email, since_ts, exclude_urls=exclude_urls)
@@ -1211,6 +1239,7 @@ def first_visible(locator_candidates):
 
 
 def fill_login_help_email(page, account_email):
+    """Submit the email recovery form on Netflix LoginHelp before touching the mailbox."""
     # Dismiss common cookie banner when it blocks the form.
     for candidate in [
         page.get_by_role("button", name=re.compile(r"accept|agree|قبول|موافق", re.I)),
@@ -1223,15 +1252,17 @@ def fill_login_help_email(page, account_email):
         except Exception:
             pass
 
-    # Some layouts require choosing Email before the input is shown.
+    # Explicitly select Email recovery if Netflix shows Email/SMS choices.
     for candidate in [
         page.get_by_role("radio", name=re.compile(r"email|البريد", re.I)),
         page.locator('input[type="radio"][value*="email" i]'),
+        page.locator('input[type="radio"][id*="email" i]'),
     ]:
         try:
-            if candidate.count() and candidate.first.is_visible() and not candidate.first.is_checked():
-                candidate.first.check(force=True)
-                page.wait_for_timeout(300)
+            if candidate.count() and candidate.first.is_visible():
+                if not candidate.first.is_checked():
+                    candidate.first.check(force=True)
+                    page.wait_for_timeout(400)
                 break
         except Exception:
             pass
@@ -1242,22 +1273,45 @@ def fill_login_help_email(page, account_email):
             page.locator('input[name="email"]'),
             page.locator('input[id*="email" i]'),
             page.locator('input[autocomplete="email"]'),
+            page.locator('input[data-uia*="email" i]'),
         ]
     )
     if not field:
         raise RuntimeError("email field not found")
-    field.fill(account_email)
 
+    field.click()
+    field.fill(account_email)
+    try:
+        if normalize_email(field.input_value()) != normalize_email(account_email):
+            raise RuntimeError("email field not found")
+    except PlaywrightTimeoutError:
+        raise RuntimeError("email field not found")
+
+    # Prefer the exact "send me an email" action. Generic submit is only a fallback.
     button = first_visible(
         [
-            page.get_by_role("button", name=re.compile(r"email|send|إرسال|البريد|text me|رسالة", re.I)),
+            page.get_by_role(
+                "button",
+                name=re.compile(
+                    r"send me an email|email me|send email|أرسل لي رسالة بريد إلكتروني|"
+                    r"ارسل لي رسالة بريد الكتروني|إرسال.*بريد|ارسال.*بريد",
+                    re.I,
+                ),
+            ),
+            page.locator('button[data-uia*="email" i][type="submit"]'),
             page.locator('button[type="submit"]'),
             page.locator('input[type="submit"]'),
         ]
     )
     if not button:
         raise RuntimeError("submit button not found")
+
     button.click()
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=8000)
+    except PlaywrightTimeoutError:
+        pass
+    page.wait_for_timeout(700)
 
 
 
@@ -1447,11 +1501,16 @@ def _send_rotation_debug_screenshots(chat_id, exc):
 def rotate_netflix_password(account_email, new_password, sign_out_all):
     generator_mail_session = None
     exclude_urls = set()
+    baseline_message_ids = set()
     if MAIL_MODE == "generator":
         generator_mail_session = generator_session()
         try:
-            for old in generator_read_messages(generator_mail_session, account_email)[:20]:
-                exclude_urls.update(u for u in old.get("urls", []) if is_netflix_reset_url(u))
+            # Snapshot the mailbox BEFORE requesting recovery.  The waiter below ignores
+            # every message already present, so old signup/verification mail cannot win.
+            for old in generator_read_messages(generator_mail_session, account_email)[:30]:
+                if old.get("id"):
+                    baseline_message_ids.add(str(old["id"]))
+                exclude_urls.update(u for u in old.get("urls", []) if u)
         except Exception:
             pass
 
@@ -1481,6 +1540,7 @@ def rotate_netflix_password(account_email, new_password, sign_out_all):
                 account_email,
                 reset_requested_at,
                 exclude_urls=exclude_urls,
+                exclude_message_ids=baseline_message_ids,
                 generator_mail_session=generator_mail_session,
             )
 
