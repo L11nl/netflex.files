@@ -61,7 +61,7 @@ ALLOWED_NETFLIX_DOMAINS = {
 NETFLIX_LOGIN_HELP_URL = os.getenv(
     "NETFLIX_LOGIN_HELP_URL", "https://www.netflix.com/iq/LoginHelp"
 )
-MAIL_MODE = os.getenv("MAIL_MODE", "imap").strip().lower()  # imap | generator
+MAIL_MODE = os.getenv("MAIL_MODE", "generator").strip().lower()  # generator | imap
 RESET_MAIL_TIMEOUT = int(os.getenv("RESET_MAIL_TIMEOUT_SECONDS", "180"))
 RESET_MAIL_POLL = float(os.getenv("RESET_MAIL_POLL_SECONDS", "3"))
 
@@ -843,7 +843,15 @@ def is_authorized_netflix_email(address):
 
 
 def strong_enough(password):
-    return 6 <= len(password) <= 60
+    # Match Netflix current password guidance more closely so a weak/default
+    # password is rejected before opening the reset flow.
+    return (
+        8 <= len(password) <= 60
+        and bool(re.search(r"[A-Z]", password))
+        and bool(re.search(r"[a-z]", password))
+        and bool(re.search(r"\d", password))
+        and bool(re.search(r"[^A-Za-z0-9]", password))
+    )
 
 
 def decode_mime_header(value):
@@ -1304,6 +1312,25 @@ def fill_new_password_form(page, new_password, sign_out_all):
     except PlaywrightTimeoutError:
         pass
     page.wait_for_timeout(1200)
+
+    # Netflix can leave the form visible when it rejects a weak/common password.
+    # Detect that case explicitly instead of returning the same generic failure.
+    try:
+        body_text = page.locator("body").inner_text(timeout=3000).lower()
+    except Exception:
+        body_text = ""
+    rejection_markers = (
+        "not secure",
+        "too common",
+        "same as your last password",
+        "كلمة المرور هذه غير آمنة",
+        "كلمة المرور تلك غير آمنة",
+        "شائعة للغاية",
+        "نفس كلمة المرور",
+    )
+    if any(marker in body_text for marker in rejection_markers):
+        raise RuntimeError("password rejected")
+
     remaining = page.locator('input[type="password"]')
     visible_remaining = 0
     for i in range(remaining.count()):
@@ -1378,6 +1405,9 @@ def password_rotation_worker(chat_id, user_id, account_email, status_message_id)
             new_password = str(BOT_STATE.get("netflix_default_password", DEFAULT_PASSWORD_FALLBACK))
             sign_out_all = bool(BOT_STATE.get("netflix_sign_out_all", True))
 
+        if not strong_enough(new_password):
+            raise RuntimeError("weak configured password")
+
         rotate_netflix_password(account_email, new_password, sign_out_all)
         bot.edit_message_text(
             "تم تغيير كلمة المرور بنجاح ✅",
@@ -1385,14 +1415,49 @@ def password_rotation_worker(chat_id, user_id, account_email, status_message_id)
             status_message_id,
         )
     except Exception as exc:
-        # Do not leak email contents, reset URLs, selectors, credentials or technical traces.
-        print(f"Netflix rotation failed: {type(exc).__name__}")
-        try:
-            bot.edit_message_text(
-                "تعذر إكمال تغيير كلمة المرور حالياً ❌",
-                chat_id,
-                status_message_id,
+        # Keep reset URLs, credentials and message contents out of Telegram/logs, but
+        # expose a safe reason so Railway debugging is no longer a blind generic error.
+        reason = str(exc)
+        if isinstance(exc, TimeoutError) or reason == "reset email timeout":
+            public_message = (
+                "لم تصل رسالة إعادة تعيين كلمة مرور Netflix ضمن مدة الانتظار ❌\n"
+                "تأكد أن الإيميل صحيح وأن صندوق Generator.email يستقبل رسائل Netflix، ثم أعد المحاولة."
             )
+            safe_code = "RESET_MAIL_TIMEOUT"
+        elif reason == "weak configured password":
+            public_message = (
+                "كلمة المرور الافتراضية الحالية لا تطابق متطلبات Netflix ❌\n"
+                "غيّرها من زر ✏️ تغيير كلمة المرور الافتراضية واجعلها 8 أحرف أو أكثر وتحتوي كبير + صغير + رقم + رمز."
+            )
+            safe_code = "WEAK_CONFIGURED_PASSWORD"
+        elif reason == "password rejected":
+            public_message = (
+                "Netflix رفضت كلمة المرور لأنها ضعيفة/شائعة أو غير مسموحة ❌\n"
+                "غيّر كلمة المرور الافتراضية إلى كلمة أقوى ثم أعد المحاولة."
+            )
+            safe_code = "PASSWORD_REJECTED"
+        elif reason in {"email field not found", "submit button not found"}:
+            public_message = "تعذر الوصول إلى نموذج إرسال رابط الاستعادة في Netflix حالياً ❌"
+            safe_code = "LOGIN_HELP_FORM_CHANGED"
+        elif reason in {"password fields not found", "save button not found", "password form still present"}:
+            public_message = "وصل رابط الاستعادة، لكن تعذر إكمال نموذج كلمة المرور في Netflix حالياً ❌"
+            safe_code = "RESET_FORM_CHANGED"
+        elif reason == "invalid reset URL":
+            public_message = "وصلت رسالة Netflix لكن لم يتم العثور على رابط استعادة صالح ❌"
+            safe_code = "INVALID_RESET_URL"
+        elif reason == "IMAP configuration is incomplete":
+            public_message = "إعداد البريد غير صحيح. اضبط MAIL_MODE=generator في Railway ثم أعد المحاولة ❌"
+            safe_code = "MAIL_MODE_IMAP_MISCONFIGURED"
+        elif isinstance(exc, PlaywrightTimeoutError):
+            public_message = "انتهت مهلة تحميل صفحة Netflix. أعد المحاولة بعد قليل ❌"
+            safe_code = "NETFLIX_PAGE_TIMEOUT"
+        else:
+            public_message = "تعذر إكمال تغيير كلمة المرور حالياً ❌"
+            safe_code = "UNKNOWN"
+
+        print(f"Netflix rotation failed: {safe_code}/{type(exc).__name__}")
+        try:
+            bot.edit_message_text(public_message, chat_id, status_message_id)
         except Exception:
             pass
     finally:
@@ -1575,7 +1640,7 @@ def handle_text_messages(message):
 
         if state == "waiting_for_new_default_password":
             if not strong_enough(text):
-                bot.send_message(message.chat.id, "يجب أن تكون كلمة المرور بين 6 و60 حرفاً.")
+                bot.send_message(message.chat.id, "كلمة المرور يجب أن تكون 8 أحرف أو أكثر وتحتوي حرفاً كبيراً وصغيراً ورقماً ورمزاً.")
                 return
             with state_lock:
                 BOT_STATE["netflix_default_password"] = text
