@@ -9,6 +9,8 @@ import threading
 import random
 import string
 import hashlib
+import tempfile
+import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
@@ -64,6 +66,7 @@ NETFLIX_LOGIN_HELP_URL = os.getenv(
 MAIL_MODE = os.getenv("MAIL_MODE", "generator").strip().lower()  # generator | imap
 RESET_MAIL_TIMEOUT = int(os.getenv("RESET_MAIL_TIMEOUT_SECONDS", "180"))
 RESET_MAIL_POLL = float(os.getenv("RESET_MAIL_POLL_SECONDS", "3"))
+NETFLIX_DEBUG_SCREENSHOTS = os.getenv("NETFLIX_DEBUG_SCREENSHOTS", "1").strip().lower() not in {"0", "false", "no", "off"}
 
 # IMAP mode
 IMAP_HOST = os.getenv("IMAP_HOST", "")
@@ -1344,6 +1347,103 @@ def fill_new_password_form(page, new_password, sign_out_all):
 
 
 
+
+def _safe_page_screenshot(page, path):
+    try:
+        page.screenshot(path=path, full_page=False, animations="disabled")
+        return os.path.exists(path) and os.path.getsize(path) > 0
+    except Exception:
+        return False
+
+
+def _copy_generator_cookies_to_browser(context, session):
+    if session is None:
+        return
+    base = GENERATOR_BASE_URL.rstrip("/") + "/"
+    cookies = []
+    try:
+        for cookie in session.cookies:
+            if not cookie.name:
+                continue
+            cookies.append({
+                "name": str(cookie.name),
+                "value": str(cookie.value),
+                "url": base,
+            })
+    except Exception:
+        cookies = []
+    if cookies:
+        try:
+            context.add_cookies(cookies)
+        except Exception:
+            pass
+
+
+def _capture_rotation_failure_screenshots(context, page, account_email, generator_mail_session, stage):
+    """Capture only on failure and return temporary image paths for Telegram."""
+    if not NETFLIX_DEBUG_SCREENSHOTS or context is None:
+        return [], None
+
+    debug_dir = tempfile.mkdtemp(prefix="netflex-debug-")
+    paths = []
+
+    if page is not None:
+        netflix_path = os.path.join(debug_dir, "01-netflix-error.png")
+        if _safe_page_screenshot(page, netflix_path):
+            paths.append((netflix_path, f"📸 Netflix — مرحلة الخطأ: {stage}"))
+
+    if MAIL_MODE == "generator" and account_email and "@" in account_email:
+        mailbox_page = None
+        try:
+            _copy_generator_cookies_to_browser(context, generator_mail_session)
+            mailbox_page = context.new_page()
+            mailbox_page.set_default_timeout(15000)
+            mailbox_url = f"{GENERATOR_BASE_URL.rstrip('/')}/{GENERATOR_INBOX}/{account_email}"
+            mailbox_page.goto(mailbox_url, wait_until="domcontentloaded", timeout=20000)
+            mailbox_page.wait_for_timeout(1800)
+            mailbox_path = os.path.join(debug_dir, "02-generator-mailbox.png")
+            if _safe_page_screenshot(mailbox_page, mailbox_path):
+                paths.append((mailbox_path, "📬 Generator.email — الصندوق وقت حدوث المشكلة"))
+        except Exception:
+            pass
+        finally:
+            if mailbox_page is not None:
+                try:
+                    mailbox_page.close()
+                except Exception:
+                    pass
+
+    return paths, debug_dir
+
+
+def _send_rotation_debug_screenshots(chat_id, exc):
+    paths = getattr(exc, "debug_screenshots", []) or []
+    debug_dir = getattr(exc, "debug_screenshot_dir", None)
+    try:
+        if not paths:
+            return
+        try:
+            bot.send_message(
+                chat_id,
+                "📸 تم التقاط صور تلقائياً وقت حدوث المشكلة حتى نعرف مكان الخلل بالضبط.",
+            )
+        except Exception:
+            pass
+
+        for path, caption in paths:
+            try:
+                with open(path, "rb") as photo:
+                    bot.send_photo(chat_id, photo, caption=caption)
+            except Exception as send_exc:
+                print(f"debug screenshot send failed: {type(send_exc).__name__}")
+    finally:
+        if debug_dir:
+            try:
+                shutil.rmtree(debug_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+
 def rotate_netflix_password(account_email, new_password, sign_out_all):
     generator_mail_session = None
     exclude_urls = set()
@@ -1359,6 +1459,8 @@ def rotate_netflix_password(account_email, new_password, sign_out_all):
     with sync_playwright() as p:
         browser = None
         context = None
+        page = None
+        stage = "بدء المتصفح"
         try:
             browser = p.chromium.launch(
                 headless=True,
@@ -1367,19 +1469,47 @@ def rotate_netflix_password(account_email, new_password, sign_out_all):
             context = browser.new_context(locale="ar-IQ", viewport={"width": 1280, "height": 900})
             page = context.new_page()
             page.set_default_timeout(20000)
+
+            stage = "فتح صفحة استعادة Netflix"
             page.goto(NETFLIX_LOGIN_HELP_URL, wait_until="domcontentloaded", timeout=30000)
+
+            stage = "إرسال طلب الاستعادة"
             fill_login_help_email(page, account_email)
 
+            stage = "انتظار رسالة Netflix"
             reset_url = wait_for_reset_link(
                 account_email,
                 reset_requested_at,
                 exclude_urls=exclude_urls,
                 generator_mail_session=generator_mail_session,
             )
+
+            stage = "فحص رابط الاستعادة"
             if not reset_url or not is_netflix_reset_url(reset_url):
                 raise RuntimeError("invalid reset URL")
+
+            stage = "فتح رابط الاستعادة"
             page.goto(reset_url, wait_until="domcontentloaded", timeout=30000)
+
+            stage = "تعبئة كلمة المرور الجديدة"
             fill_new_password_form(page, new_password, sign_out_all)
+            stage = "اكتمل التغيير"
+        except Exception as exc:
+            debug_paths, debug_dir = _capture_rotation_failure_screenshots(
+                context,
+                page,
+                account_email,
+                generator_mail_session,
+                stage,
+            )
+            try:
+                exc.debug_screenshots = debug_paths
+                exc.debug_screenshot_dir = debug_dir
+                exc.debug_stage = stage
+            except Exception:
+                if debug_dir:
+                    shutil.rmtree(debug_dir, ignore_errors=True)
+            raise
         finally:
             if context is not None:
                 try:
@@ -1396,7 +1526,6 @@ def rotate_netflix_password(account_email, new_password, sign_out_all):
                     generator_mail_session.close()
                 except Exception:
                     pass
-
 
 
 def password_rotation_worker(chat_id, user_id, account_email, status_message_id):
@@ -1460,6 +1589,7 @@ def password_rotation_worker(chat_id, user_id, account_email, status_message_id)
             bot.edit_message_text(public_message, chat_id, status_message_id)
         except Exception:
             pass
+        _send_rotation_debug_screenshots(chat_id, exc)
     finally:
         active_password_rotations.discard(user_id)
 
