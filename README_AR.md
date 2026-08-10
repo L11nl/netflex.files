@@ -1,55 +1,34 @@
-# Email Bot — نسخة نظيفة
+# النسخة المصححة لـ Railway
 
-هذه النسخة مخصصة للإيميلات فقط. تم حذف جميع الوظائف والأقسام التي لا تخص البريد، وأصبحت النسخة مخصصة للإيميلات فقط.
+هذه النسخة Python فقط، وتم حذف تعارض Node.js الذي كان يجعل Railway يحاول تشغيل `npm start`.
 
-## المميزات
-- إنشاء إيميلات عشوائية على `5xu.vn` بنفس طريقة الكود الأصلي.
-- كل مستخدم يملك إيميلاته الخاصة فقط.
-- حذف الإيميل من حساب المستخدم داخل البوت.
-- نقل الإيميل إلى مستخدم آخر بالـ Telegram ID أو `@username`، بشرط أن يكون المستلم قد بدأ البوت مرة واحدة.
-- عربي + English مع زر تبديل اللغة.
-- فحص يدوي للرسائل.
-- وصول الرسائل الجديدة للبوت تلقائياً عبر فحص دوري.
-- الاحتفاظ بنص الرسالة والروابط في مكانها.
-- قاعدة SQLite دائمة حتى لا تضيع الملكية والإعدادات بعد إعادة التشغيل.
-- اشتراك إجباري يمكن تشغيله وإيقافه من `/admin`.
+## لماذا كان النشر يفشل؟
+كان المستودع يحتوي `package.json` و`server.js` وداخل `railway.json` كان `startCommand` مضبوطاً على `npm start`، بينما البوت الجديد يعمل ببايثون وPlaywright.
+
+## ما الذي تم إصلاحه؟
+- Railway مجبر الآن على استخدام `Dockerfile` عبر `builder: DOCKERFILE`.
+- لا يوجد `npm start` أو أي Start Command تابع لـ Node.
+- التشغيل يتم من `CMD ["python", "bot.py"]` داخل Dockerfile.
+- تثبيت Chromium وملحقات Playwright يتم أثناء Build.
+- لا يوجد Healthcheck لمسار HTTP لأن هذا المشروع Telegram Bot worker وليس Web server.
+- `bot.py` تم التحقق من Syntax الخاص به.
+
+## مهم عند رفع الملفات إلى GitHub
+يفضل حذف الملفات القديمة التالية من جذر المستودع إن كانت لا تزال موجودة:
+- `package.json`
+- `server.js`
+- مجلد `public/`
+- أي `railway.json` قديم
+
+ثم ارفع ملفات هذه النسخة إلى جذر المستودع.
 
 ## Railway Variables
-انسخ القيم من `.env.example` إلى Variables في Railway.
-
-أهم القيم:
-- `BOT_TOKEN`: توكن البوت.
-- `ADMIN_IDS`: Telegram ID الخاص بك. يمكن وضع أكثر من ID مفصولة بفاصلة.
-- `DB_PATH=/data/email_bot.sqlite3`
-- `EMAIL_DOMAIN=5xu.vn`
-- `GENERATOR_BASE_URL=https://generator.email`
+استخدم المتغيرات الموجودة في `.env.example`، ولا تضع أي أسرار داخل الكود.
 
 ## Railway Volume
-حتى لا تضيع بيانات المستخدمين بعد إعادة التشغيل، أضف Volume على:
+للاحتفاظ بإعدادات كلمة المرور وخيار تسجيل الخروج بعد إعادة التشغيل، أضف Volume على:
 
 `/data`
 
-## الاشتراك الإجباري
-1. اجعل البوت Admin في القناة حتى يتمكن من التحقق من العضوية بشكل موثوق.
-2. من حساب الأدمن أرسل:
-
-`/setchannel @channelusername`
-
-للقناة الخاصة استخدم:
-
-`/setchannel -1001234567890 https://t.me/+INVITE_LINK`
-
-3. أرسل `/admin` واضغط زر **تفعيل الاشتراك الإجباري**.
-4. يمكن إيقافه من نفس الزر في أي وقت.
-
-## التشغيل المحلي
-```bash
-pip install -r requirements.txt
-export BOT_TOKEN='YOUR_TOKEN'
-export ADMIN_IDS='YOUR_TELEGRAM_ID'
-export DB_PATH='./email_bot.sqlite3'
-python bot.py
-```
-
-## ملاحظة مهمة عن التوكن
-لا تضع التوكن داخل `bot.py`. استخدم Variables في Railway أو ملف `.env` محلي غير مرفوع إلى GitHub.
+## إعدادات Railway القديمة
+إذا سبق أن وضعت Custom Start Command يدوياً في Railway مثل `npm start`، احذفه من Settings > Deploy. مع Dockerfile يجب ترك Start Command فارغاً حتى يستخدم Railway أمر CMD الموجود في Dockerfile.
